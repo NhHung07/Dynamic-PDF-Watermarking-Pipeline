@@ -1,0 +1,16 @@
+# Bảo mật AWS & SSH Keys
+*_credentials.csv
+*_accessKeys.csv
+*accessKey*.csv
+*.pem
+*.key
+.env
+
+# Môi trường Python & Tệp tạm
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.vscode/
+
+Đề tài BTL.pdf
