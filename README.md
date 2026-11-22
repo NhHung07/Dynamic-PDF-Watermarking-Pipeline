@@ -10,7 +10,7 @@
 
 | STT | Họ và tên | Mã sinh viên | Vai trò | Mảng phụ trách chính |
 |:---:|---|:---:|:---:|---|
-| **1** | **Trần Nhật Hưng** | **24021507** | Nhóm trưởng | **Tính toán & Mở rộng:** Cấu hình EC2, Cân bằng tải (ALB), Tự động mở rộng (ASG), Giám sát (CloudWatch, SNS), Tối ưu hoá góc hình học Watermark & Fast Auto-Scaling. |
+| **1** | **Trần Nhật Hưng** | **24021507** | Nhóm trưởng | **Tính toán & Mở rộng:** Cấu hình EC2, Cân bằng tải (ALB), Tự động mở rộng (ASG), Giám sát (CloudWatch, SNS), Fast Auto-Scaling. |
 | **2** | **Nguyễn Nam Khánh** | **24021531** | Thành viên | **Hạ tầng & Lưu trữ:** Thiết kế VPC Multi-AZ, Phân quyền & Bảo mật (Security Group, IAM Role), Lưu trữ đối tượng (S3) & Bộ nhớ đệm tệp dùng chung (EFS). |
 | **3** | **Đỗ Lê Duy** | **24021445** | Thành viên | **Ứng dụng & Dữ liệu:** Cơ sở dữ liệu kiểm toán (RDS PostgreSQL), Phát triển Microservice REST API (FastAPI + PyMuPDF) & Kịch bản kiểm thử tải đa luồng (Load Testing). |
 
@@ -41,73 +41,70 @@ Hệ thống được thiết kế theo mô hình **Microservice dùng chung (Sh
 
 ---
 
-## 🏛 3. Sơ đồ kiến trúc & Luồng dữ liệu trên AWS
+## 🏛 3. Sơ đồ kiến trúc & Luồng xử lý trên AWS
 
-### 3.1. Sơ đồ kiến trúc mạng (Region: ap-southeast-1, VPC CIDR: 10.0.0.0/16)
+### 3.1. Sơ đồ kiến trúc phân tầng (Tiered Architecture Diagram)
+
+Hạ tầng được triển khai tại vùng **AWS Singapore (`ap-southeast-1`)** với dải mạng **VPC CIDR `10.0.0.0/16`**, tuân thủ nghiêm ngặt mô hình kiến trúc chuẩn doanh nghiệp (AWS Well-Architected Framework): tách biệt hoàn toàn tầng Public (Internet-Facing) và Private (Không gán Public IP, an toàn tuyệt đối).
 
 ```mermaid
 flowchart TD
-    subgraph Internet ["Môi trường Internet / Khách hàng"]
-        Clients["Clients / Hệ thống nghiệp vụ\n(CRM, ERP, Billing, Web UI, Load Test)"]
+    subgraph ClientLayer ["1. TẦNG CLIENT & HỆ THỐNG NGHIỆP VỤ"]
+        Client["Clients & Hệ thống nghiệp vụ\n(CRM, ERP, Core Banking, Web Portal, Load Test)"]
     end
 
-    subgraph VPC ["Amazon Virtual Private Cloud (10.0.0.0/16)"]
-        subgraph PublicSubnets ["Public Subnets (ap-southeast-1a & 1b)"]
-            ALB["Application Load Balancer (ALB)\n(Port 80 -> Health Check /health)"]
-            NAT["NAT Gateway\n(Internet 1 chiều cho Private Subnets)"]
+    subgraph AWSCloud ["2. AMAZON VPC (10.0.0.0/16 | ap-southeast-1)"]
+        subgraph PublicSubnet ["Public Subnet (Internet-Facing)"]
+            ALB["Application Load Balancer (ALB)\n(Port 80 | Round-Robin | Health Check /health)"]
+            NAT["NAT Gateway\n(Cấp Internet 1 chiều cho Private Subnets)"]
         end
 
-        subgraph PrivateSubnets ["Private Subnets (10.0.11.0/24 & 10.0.12.0/24)"]
-            ASG["Auto Scaling Group (EC2 Workers)\n(FastAPI + PyMuPDF | Port 8000)\n- Min: 2, Max: 4, Desired: 2"]
-            EFS["Amazon EFS (NFSv4)\n(Shared Input Cache & Font Unicode)"]
-            RDS[("Amazon RDS (PostgreSQL 16)\n(Bảng audit_logs & Lịch sử cấp phát)")]
+        subgraph PrivateSubnet ["Private Subnets (Multi-AZ | An toàn, không có Public IP)"]
+            ASG["Auto Scaling Group (EC2 Cluster: 2 - 4 Workers)\n• AZ 1a (10.0.11.0/24) | AZ 1b (10.0.12.0/24)\n• FastAPI v2.1 Engine + PyMuPDF | Port 8000 nội bộ"]
+            EFS["Amazon EFS (NFSv4 Mount /mnt/efs)\n• Cache PDF mẫu gốc & Font Unicode tiếng Việt"]
+            RDS[("Amazon RDS PostgreSQL 16\n• Bảng audit_logs (Lưu vết SHA-256 & Worker Host)")]
         end
     end
 
-    subgraph AWSStorage ["Lưu trữ & Giám sát AWS"]
-        S3[("Amazon S3 (uet-pdf-watermark)\n- code/: Mã nguồn main.py\n- input/: PDF mẫu\n- output/: PDF hoàn thiện")]
-        CW["Amazon CloudWatch & SNS\n(Alarm CPU >= 50% 1-min -> Fast Scale Out)"]
+    subgraph ManagedStorage ["3. DỊCH VỤ QUẢN TRỊ AWS (AWS Managed Services)"]
+        S3[("Amazon S3 Bucket (uet-pdf-watermark)\n• input/: Chứa file gốc\n• output/: Lưu PDF đã đóng dấu\n• code/: Nạp mã nguồn")]
+        CW["Amazon CloudWatch & SNS\n• Fast Scale-Out Alarm (CPU >= 50% trong 60s)\n• Tự động kích hoạt ASG tăng giảm Worker"]
     end
 
-    Clients -->|1. POST /api/v1/watermark| ALB
-    ALB -->|2. Cân bằng tải HTTP| ASG
-    ASG -->|3. Đọc cache PDF mẫu & Font| EFS
-    ASG -->|4. Lưu file hoàn thiện & Sinh Pre-signed URL| S3
-    ASG -->|5. Ghi vết kiểm toán (SHA-256, Worker Host, Time VN)| RDS
-    ASG -->|6. Trả URL có Content-Disposition UTF-8| ALB
-    ALB -->|7. Phản hồi JSON kết quả| Clients
-    Clients -->|8. Tải trực tiếp tốc độ cao| S3
-    ASG -.->|Gửi chỉ số CPU| CW
-    CW -.->|Kích hoạt Scale Out thêm EC2| ASG
+    %% Luồng yêu cầu nghiệp vụ
+    Client -->|"① Gửi Request (POST /api/v1/watermark)"| ALB
+    ALB -->|"② Cân bằng tải HTTP (Port 8000)"| ASG
+    ASG -->|"③ Đọc nhanh File mẫu & Font (<5ms)"| EFS
+    ASG -->|"④ Ghi vết kiểm toán (SHA-256, Host, Time VN)"| RDS
+    ASG -->|"⑤ Upload PDF hoàn thiện & Sinh Pre-signed URL"| S3
+    ASG -->|"⑥ Trả JSON kết quả có Link tải S3"| ALB
+    ALB -->|"⑦ Phản hồi HTTP 200 OK"| Client
+    Client -.->|"⑧ Tải trực tiếp PDF qua Pre-signed URL"| S3
+
+    %% Luồng giám sát & Tự động mở rộng
+    ASG -.->|"Đẩy chỉ số CPU (chu kỳ 60s)"| CW
+    CW -.->|"Kích hoạt Scale Out thêm Worker"| ASG
 ```
 
-### 3.2. Phân vai lưu trữ: EFS vs S3
-* **Amazon EFS (`/mnt/efs`):** Đóng vai trò **Bộ nhớ đệm dùng chung (Shared Input Cache)**. Lưu trữ tài liệu mẫu và font Unicode chuẩn tiếng Việt. Khi 1 máy kéo file mẫu từ S3 về EFS, toàn bộ các máy khác trong cụm đều truy cập được ngay lập tức ở tốc độ mạng nội bộ ($< 5\text{ms}$), loại bỏ hoàn toàn việc nghẽn băng thông S3 (Rate Limiting).
-* **Amazon S3 (`uet-pdf-watermark`):** Đóng vai trò **Lưu trữ vĩnh viễn (Output Storage)** với độ bền $99.999999999\%$. Hệ thống cấp phát **S3 Pre-signed URL** kèm mã hóa RFC 5987 để người dùng tải trực tiếp từ CDN S3 mà không chiếm dụng băng thông của EC2 Worker.
+### 3.2. Luồng xử lý chi tiết (Request Lifecycle)
+
+| Bước | Thành phần | Hành vi thực hiện |
+|:---:|---|---|
+| **1** | **Client $\to$ ALB** | Client/Microservice gửi yêu cầu `POST /api/v1/watermark` (JSON chứa mã tài liệu, nội dung watermark, mã giao dịch). |
+| **2** | **ALB $\to$ EC2 Worker** | ALB cân bằng tải thuật toán Round-Robin, định tuyến request an toàn vào 1 trong các EC2 Worker trong Private Subnet. |
+| **3** | **EC2 Worker $\leftrightarrow$ EFS** | Worker kiểm tra EFS (`/mnt/efs/input/`). Nếu có sẵn file mẫu và font Unicode thì nạp ngay (<5ms), nếu chưa có mới đồng bộ từ S3. |
+| **4** | **EC2 Worker Engine** | PyMuPDF giải mã nhị phân, tính toán tâm trang $(cx, cy)$, vẽ watermark chữ chéo $45^\circ$, tiêu đề, con dấu và băm mã **SHA-256**. |
+| **5** | **EC2 $\to$ RDS PostgreSQL** | Worker ghi nhận nhật ký kiểm toán vào bảng `audit_logs` (lưu SHA-256, `worker_host`, thời gian Việt Nam GMT+7). |
+| **6** | **EC2 $\to$ Amazon S3** | Worker đẩy file đã đóng dấu lên thư mục `output/` trên S3 và sinh **S3 Pre-signed URL** (kèm tiêu đề chuẩn RFC 5987 tiếng Việt). |
+| **7** | **EC2 $\to$ ALB $\to$ Client** | Trả về JSON chứa mã băm SHA-256, thời gian xử lý, tên Worker Host và link tải trực tiếp. |
+| **8** | **Client $\to$ S3 CDN** | Người dùng nhấn link tải trực tiếp từ Amazon S3, hoàn toàn không chiếm dụng băng thông của EC2 Worker. |
+| **(*)** | **CloudWatch $\leftrightarrow$ ASG** | Khi lượng request tăng vọt khiến CPU $\ge 50\%$ trong 60 giây, CloudWatch Alarm lập tức ra lệnh cho ASG bổ sung EC2 Worker mới. |
 
 ---
 
-## 🌟 4. Các tính năng kỹ thuật nổi bật
+## 🔌 4. Đặc tả RESTful API
 
-1. **Thuật toán hình học Watermark tự thích ứng (Dynamic Geometric Watermarking):**
-   * Tính toán tâm chính xác của trang giấy $(cx, cy) = (w/2, h/2)$.
-   * Góc nghiêng động: $\theta = \arctan(h/w) \times 0.82$ ($45^\circ$ cho khổ dọc A4, $32^\circ$ cho khổ ngang Landscape).
-   * Tự động co giãn cỡ chữ (Adaptive Font Sizing từ 13pt đến 38pt) đảm bảo chuỗi ký tự dù ngắn hay dài đều hiển thị trọn vẹn ở chính giữa trang, không bao giờ bị cắt cụt hay tràn mép giấy.
-2. **Bảo toàn tên tệp UTF-8 tiếng Việt khi tải về:**
-   * Sử dụng tiêu chuẩn **RFC 5987 / RFC 6266**: `Content-Disposition: attachment; filename="doc.pdf"; filename*=UTF-8''...`
-   * Người dùng tải về tệp có dấu đầy đủ: `UET1002 4.Trần Nhật Hưng.24021507_watermarked.pdf`.
-3. **Múi giờ Việt Nam (GMT+7 / Asia/Ho_Chi_Minh):**
-   * Mọi mốc thời gian lưu trữ và hiển thị đều được chuẩn hóa chính xác sang giờ Việt Nam (`YYYY-MM-DD HH:mm:ss`).
-4. **Cơ chế Fast Auto-Scaling (1-Minute Alarm):**
-   * CloudWatch Alarm `Fast-HighCPU-ScaleOut-Alarm` đánh giá chu kỳ 60 giây CPU $\ge 50\%$ kích hoạt mở rộng máy chủ ngay lập tức.
-5. **Cổng kiểm định toàn vẹn trực tuyến (Document Integrity Verification):**
-   * Nhập mã băm SHA-256 trên Web Portal hoặc gọi API `/api/v1/audit-logs/verify/{sha256}` để kiểm tra tính nguyên bản của tài liệu.
-
----
-
-## 🔌 5. Đặc tả RESTful API
-
-### 5.1. Đóng dấu tài liệu JSON (`POST /api/v1/watermark`)
+### 4.1. Đóng dấu tài liệu JSON (`POST /api/v1/watermark`)
 Dành cho các Microservice (CRM, Billing, HRM) tích hợp tự động:
 
 **Request Body:**
@@ -145,7 +142,7 @@ Dành cho các Microservice (CRM, Billing, HRM) tích hợp tự động:
 }
 ```
 
-### 5.2. Kiểm định tài liệu (`GET /api/v1/audit-logs/verify/{sha256}`)
+### 4.2. Kiểm định tài liệu (`GET /api/v1/audit-logs/verify/{sha256}`)
 Tra cứu nguồn gốc và tính toàn vẹn của tệp PDF:
 
 **Response (200 OK - Hợp lệ):**
@@ -164,7 +161,7 @@ Tra cứu nguồn gốc và tính toàn vẹn của tệp PDF:
 }
 ```
 
-### 5.3. Các endpoint khác
+### 4.3. Các endpoint khác
 * `GET /health`: Kiểm tra sức khỏe phục vụ ALB Target Group.
 * `GET /api/v1/audit-logs?limit=50`: Lấy danh sách nhật ký kiểm toán gần nhất.
 * `POST /api/watermark`: Endpoint tương thích ngược hỗ trợ Form Upload trực tiếp từ máy tính.
@@ -172,7 +169,7 @@ Tra cứu nguồn gốc và tính toàn vẹn của tệp PDF:
 
 ---
 
-## 📁 6. Cấu trúc mã nguồn
+## 📁 5. Cấu trúc mã nguồn
 
 ```text
 Dynamic-PDF-Watermarking-Pipeline/
@@ -190,9 +187,9 @@ Dynamic-PDF-Watermarking-Pipeline/
 
 ---
 
-## 🛠 7. Hướng dẫn cài đặt & Thực thi
+## 🛠 6. Hướng dẫn cài đặt & Thực thi
 
-### 7.1. Cài đặt môi trường cục bộ
+### 6.1. Cài đặt môi trường cục bộ
 ```bash
 # 1. Tạo và kích hoạt môi trường ảo
 python3 -m venv .venv
@@ -207,14 +204,14 @@ python3 main.py
 # Truy cập giao diện: http://localhost:8000
 ```
 
-### 7.2. Kiểm thử mã băm SHA-256 cục bộ
+### 6.2. Kiểm thử mã băm SHA-256 cục bộ
 ```bash
 python3 get_sha256.py ModelOptimization.pdf
 # Hoặc chạy tương tác kéo-thả file vào terminal:
 python3 get_sha256.py
 ```
 
-### 7.3. Kịch bản chạy bắn tải & Demo Auto-Scaling (6 phút)
+### 6.3. Kịch bản chạy bắn tải & Demo Auto-Scaling (6 phút)
 ```bash
 # Bắn tải đồng thời 25 luồng trong 360 giây tới Application Load Balancer
 python3 load_test.py
@@ -224,7 +221,7 @@ python3 load_test.py
   * Thông báo màu vàng khi máy chủ thứ 3 & thứ 4 gia nhập nhận tải.
   * Tốc độ xử lý (req/s), độ trễ (ms) và bảng phân bổ tỷ lệ phần trăm giữa các EC2.
 
-### 7.4. Quản trị hạ tầng AWS từ xa (`manage_aws.py`)
+### 6.4. Quản trị hạ tầng AWS từ xa (`manage_aws.py`)
 > Đặt file `hung_accessKeys.csv` vào thư mục gốc để script tự nạp quyền an toàn.
 
 ```bash
@@ -240,7 +237,7 @@ python3 manage_aws.py sleep --keep-alb
 
 ---
 
-## 💰 8. Bảng ước tính chi phí hàng tháng (Region: ap-southeast-1)
+## 💰 7. Bảng ước tính chi phí hàng tháng (Region: ap-southeast-1)
 
 | Dịch vụ AWS | Quy mô giả định (24/7) | Mục đích sử dụng | Đơn giá tham khảo | Chi phí ước tính/tháng |
 |---|---|---|---|:---:|
@@ -253,6 +250,3 @@ python3 manage_aws.py sleep --keep-alb
 | **Amazon RDS** | 1 instance db.t4g.micro (PostgreSQL) | Nhật ký kiểm toán `audit_logs` | ~0.018 USD/giờ + đĩa | ~15.44 USD |
 | **CloudWatch & SNS** | 5 Metrics, 3 Alarms, Email SNS | Cảm biến giám sát & kích hoạt ASG | Ngưỡng Free Tier / 0.10$ | ~0.30 USD |
 | **TỔNG CỘNG** | | | | **~136.13 USD/tháng** *(hoặc **~96.18 USD** với NAT Instance)* |
-
-> [!TIP]
-> **Chiến lược tối ưu ngân sách thực tế:** Sử dụng lệnh `python3 manage_aws.py sleep` ngay sau các buổi học và demo thực hành để hạ toàn bộ chi phí EC2, ALB, NAT và RDS về **0 USD/giờ**, bảo toàn tuyệt đối hạn mức credit của tài khoản.
