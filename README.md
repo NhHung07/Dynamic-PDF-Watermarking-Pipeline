@@ -174,7 +174,7 @@ Tra cứu nguồn gốc và tính toàn vẹn của tệp PDF:
 ```text
 Dynamic-PDF-Watermarking-Pipeline/
 ├── main.py                   # Microservice FastAPI v2.1 (Watermarking Engine, API, Web Portal)
-├── load_test.py              # Công cụ bắn tải đa luồng 6 phút, in Worker Host trực tiếp
+├── load_test.py              # Công cụ bắn tải đa luồng
 ├── get_sha256.py             # Script tính mã SHA-256 cục bộ và tạo link kiểm định nhanh
 ├── manage_aws.py             # Script tự động hóa Wake / Sleep hạ tầng AWS về 0 USD/h
 ├── ModelOptimization.pdf     # Tệp PDF kiểm thử mẫu (47 trang)
