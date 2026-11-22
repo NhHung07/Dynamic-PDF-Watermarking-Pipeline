@@ -19,7 +19,7 @@ import requests
 
 # Cấu hình mặc định
 DEFAULT_ALB_HOST = "http://PDF-Watermark-ALB-1315238985.ap-southeast-1.elb.amazonaws.com"
-DEFAULT_DURATION = 240   # 4 phút (60s đánh giá CPU + 60s EC2 boot & ALB Health Check + 120s chia tải đa máy chủ)
+DEFAULT_DURATION = 360   # 6 phút chuẩn kịch bản Demo (Đánh giá tải -> Scale EC2 #3 & #4 -> Ổn định chia tải -> Tổng kết)
 DEFAULT_CONCURRENCY = 25 # 25 luồng đồng thời (đủ để đẩy CPU lên ~75-85% kích hoạt Auto Scaling)
 
 # Các Client Microservice mô phỏng trong hệ sinh thái
