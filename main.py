@@ -169,6 +169,7 @@ def record_audit(
             "doc_code": doc_code or doc_name,
             "pages_count": pages_count,
             "sha256": sha256_hash,
+            "sha256_hash": sha256_hash,
             "file_hash": sha256_hash,
             "worker_host": worker_host,
             "output_key": output_key,
@@ -636,11 +637,9 @@ def get_audit_logs(
                 where_clauses.append("client_id = :cid")
                 params["cid"] = client_id
             if sha256 and isinstance(sha256, str):
-                if "sha256" in existing_cols:
-                    where_clauses.append("sha256 = :h")
-                    params["h"] = sha256
-                elif "file_hash" in existing_cols:
-                    where_clauses.append("file_hash = :h")
+                h_col = next((c for c in ["sha256", "sha256_hash", "file_hash"] if c in existing_cols), None)
+                if h_col:
+                    where_clauses.append(f"{h_col} = :h")
                     params["h"] = sha256
 
             sql = f"SELECT * FROM audit_logs WHERE {' AND '.join(where_clauses)} ORDER BY id DESC LIMIT :lim OFFSET :off"
@@ -670,7 +669,7 @@ def verify_document_integrity(sha256: str):
                 return {"verified": False, "sha256": sha256, "message": "Chưa có bảng dữ liệu kiểm toán."}
             existing_cols = {c["name"] for c in insp.get_columns("audit_logs")}
             
-            col_match = "sha256" if "sha256" in existing_cols else ("file_hash" if "file_hash" in existing_cols else None)
+            col_match = next((c for c in ["sha256", "sha256_hash", "file_hash"] if c in existing_cols), None)
             if not col_match:
                 return {"verified": False, "sha256": sha256, "message": "Cột mã băm kiểm định chưa được thiết lập."}
 
