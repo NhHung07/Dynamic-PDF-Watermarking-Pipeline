@@ -70,11 +70,40 @@ audit_logs = Table(
     Column("metadata_json", String(1024), nullable=True),
 )
 
-# Tự động tạo bảng nếu chưa có (Tương thích cả SQLite, MySQL và PostgreSQL RDS)
+# Tự động tạo bảng nếu chưa có & tự động thêm các cột mới vào RDS PostgreSQL/MySQL
+def init_and_migrate_db():
+    try:
+        insp = sa.inspect(engine)
+        if not insp.has_table("audit_logs"):
+            metadata.create_all(engine)
+        else:
+            existing_cols = {c["name"] for c in insp.get_columns("audit_logs")}
+            new_columns = [
+                ("request_id", "VARCHAR(64)"),
+                ("client_id", "VARCHAR(64)"),
+                ("doc_name", "VARCHAR(255)"),
+                ("pages_count", "INTEGER DEFAULT 0"),
+                ("processing_time_ms", "FLOAT"),
+                ("created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+                ("student_id", "VARCHAR(64)"),
+                ("full_name", "VARCHAR(128)"),
+                ("doc_code", "VARCHAR(128)"),
+                ("metadata_json", "TEXT"),
+            ]
+            with engine.begin() as conn:
+                for c_name, c_type in new_columns:
+                    if c_name not in existing_cols:
+                        try:
+                            conn.execute(text(f"ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS {c_name} {c_type}"))
+                        except Exception:
+                            pass
+    except Exception as e:
+        print(f"[WARN] Database schema check/migration: {e}")
+
 try:
-    metadata.create_all(engine)
+    init_and_migrate_db()
 except Exception as e:
-    print(f"[WARN] Database schema auto-creation skipped or failed: {e}")
+    print(f"[WARN] Database auto-migration skipped: {e}")
 
 # ==============================================================================
 # 3. FONT UNICODE & CÁC HÀM TIỆN ÍCH HỆ THỐNG
@@ -127,26 +156,37 @@ def record_audit(
     doc_code: Optional[str] = None,
     meta_dict: Optional[dict] = None,
 ):
-    """Ghi vết kiểm toán chuẩn Microservice vào cơ sở dữ liệu."""
+    """Ghi vết kiểm toán chuẩn Microservice vào cơ sở dữ liệu (tương thích mọi phiên bản schema)."""
     try:
+        insp = sa.inspect(engine)
+        if not insp.has_table("audit_logs"):
+            metadata.create_all(engine)
+        cols = {c["name"] for c in insp.get_columns("audit_logs")}
+        candidate_values = {
+            "request_id": request_id,
+            "client_id": client_id or "default",
+            "doc_name": doc_name,
+            "doc_code": doc_code or doc_name,
+            "pages_count": pages_count,
+            "sha256": sha256_hash,
+            "file_hash": sha256_hash,
+            "worker_host": worker_host,
+            "output_key": output_key,
+            "s3_key": output_key,
+            "processing_time_ms": proc_time_ms,
+            "created_at": datetime.now(timezone.utc),
+            "student_id": student_id,
+            "full_name": full_name,
+            "metadata_json": json.dumps(meta_dict) if meta_dict else None,
+        }
+        insert_cols = [k for k in candidate_values if k in cols]
+        if not insert_cols:
+            return
+        col_list = ", ".join(insert_cols)
+        val_list = ", ".join(f":{k}" for k in insert_cols)
+        sql = text(f"INSERT INTO audit_logs ({col_list}) VALUES ({val_list})")
         with engine.begin() as conn:
-            conn.execute(
-                audit_logs.insert().values(
-                    request_id=request_id,
-                    client_id=client_id or "default",
-                    doc_name=doc_name,
-                    pages_count=pages_count,
-                    sha256=sha256_hash,
-                    worker_host=worker_host,
-                    output_key=output_key,
-                    processing_time_ms=proc_time_ms,
-                    created_at=datetime.now(timezone.utc),
-                    student_id=student_id,
-                    full_name=full_name,
-                    doc_code=doc_code or doc_name,
-                    metadata_json=json.dumps(meta_dict) if meta_dict else None,
-                )
-            )
+            conn.execute(sql, {k: candidate_values[k] for k in insert_cols})
     except Exception as e:
         print(f"[WARN] Failed to insert audit log: {e}")
 
@@ -585,13 +625,26 @@ def get_audit_logs(
         actual_offset = int(offset) if isinstance(offset, (int, str)) and str(offset).isdigit() else 0
 
         with engine.connect() as conn:
-            stmt = select(audit_logs).order_by(desc(audit_logs.c.id))
-            if client_id and isinstance(client_id, str):
-                stmt = stmt.where(audit_logs.c.client_id == client_id)
+            insp = sa.inspect(engine)
+            if not insp.has_table("audit_logs"):
+                return {"total": 0, "logs": []}
+            existing_cols = {c["name"] for c in insp.get_columns("audit_logs")}
+            
+            where_clauses = ["1=1"]
+            params = {"lim": actual_limit, "off": actual_offset}
+            if client_id and isinstance(client_id, str) and "client_id" in existing_cols:
+                where_clauses.append("client_id = :cid")
+                params["cid"] = client_id
             if sha256 and isinstance(sha256, str):
-                stmt = stmt.where(audit_logs.c.sha256 == sha256)
-            stmt = stmt.limit(actual_limit).offset(actual_offset)
-            results = conn.execute(stmt).fetchall()
+                if "sha256" in existing_cols:
+                    where_clauses.append("sha256 = :h")
+                    params["h"] = sha256
+                elif "file_hash" in existing_cols:
+                    where_clauses.append("file_hash = :h")
+                    params["h"] = sha256
+
+            sql = f"SELECT * FROM audit_logs WHERE {' AND '.join(where_clauses)} ORDER BY id DESC LIMIT :lim OFFSET :off"
+            results = conn.execute(text(sql), params).fetchall()
 
             logs_list = []
             for r in results:
@@ -612,8 +665,17 @@ def verify_document_integrity(sha256: str):
     """
     try:
         with engine.connect() as conn:
-            stmt = select(audit_logs).where(audit_logs.c.sha256 == sha256.strip()).limit(1)
-            row = conn.execute(stmt).fetchone()
+            insp = sa.inspect(engine)
+            if not insp.has_table("audit_logs"):
+                return {"verified": False, "sha256": sha256, "message": "Chưa có bảng dữ liệu kiểm toán."}
+            existing_cols = {c["name"] for c in insp.get_columns("audit_logs")}
+            
+            col_match = "sha256" if "sha256" in existing_cols else ("file_hash" if "file_hash" in existing_cols else None)
+            if not col_match:
+                return {"verified": False, "sha256": sha256, "message": "Cột mã băm kiểm định chưa được thiết lập."}
+
+            sql = text(f"SELECT * FROM audit_logs WHERE {col_match} = :h ORDER BY id DESC LIMIT 1")
+            row = conn.execute(sql, {"h": sha256.strip()}).fetchone()
             if not row:
                 return {
                     "verified": False,
