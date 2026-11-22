@@ -4,7 +4,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import requests
 
-ALB_URL = "http://PDF-Watermark-ALB-924215170.ap-southeast-1.elb.amazonaws.com/api/watermark"
+ALB_URL = "http://PDF-Watermark-ALB-1315238985.ap-southeast-1.elb.amazonaws.com/api/watermark"
 DURATION_SECONDS = 360  # 6 phút: 3 phút đánh giá CPU + 90s khởi tạo EC2 thứ 3 + 90s chia tải
 CONCURRENCY = 28        # 20 luồng với file 47 trang giữ CPU ~80-90%, không làm nghẽn /health
 
