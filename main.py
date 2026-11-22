@@ -291,15 +291,23 @@ def apply_watermarks(
 
         # 1. Chèn Watermark chữ chéo chìm (Tự thích ứng kích thước & căn chính giữa trang)
         if diagonal_text:
-            angle_deg = -38.0  # Độ nghiêng hướng chéo lên từ góc dưới-trái sang trên-phải
+            # Điểm tâm chính xác của trang giấy
+            cx, cy = w / 2.0, h / 2.0
+
+            # Góc nghiêng chéo tính theo tỷ lệ trang (hướng chéo lên từ góc dưới-trái qua tâm lên góc trên-phải)
+            diag_angle = math.degrees(math.atan2(h, w))
+            angle_deg = min(48.0, max(30.0, diag_angle * 0.82))
             rad = math.radians(angle_deg)
             cos_a = math.cos(rad)
             sin_a = math.sin(rad)
 
             # Tính chiều dài khả dụng tối đa dọc theo hướng nghiêng để chữ không chạm mép giấy
-            # Ray: x(t) = w/2 + t*cos, y(t) = h/2 + t*sin => |t| <= (w/2)/|cos| và |t| <= (h/2)/|sin|
-            t_max = min((w * 0.44) / max(0.001, abs(cos_a)), (h * 0.44) / max(0.001, abs(sin_a)))
-            max_allowed_len = 2.0 * t_max * 0.88  # Chừa 12% lề an toàn
+            # Chừa lề an toàn tối thiểu: 45pt hai bên, 55pt trên dưới
+            margin_x = 45.0
+            margin_y = 55.0
+            max_len_x = max(100.0, (cx - margin_x) / cos_a * 2.0)
+            max_len_y = max(100.0, (cy - margin_y) / sin_a * 2.0)
+            max_allowed_len = min(max_len_x, max_len_y)
 
             # Ước lượng độ dài văn bản tại cỡ chữ 10pt
             test_len = measure_text_width(diagonal_text, 10.0)
@@ -316,12 +324,10 @@ def apply_watermarks(
                 fs -= 1
                 actual_tlen = measure_text_width(diagonal_text, fs)
 
-            # Điểm tâm chính xác của trang giấy
-            cx, cy = w / 2.0, h / 2.0
-
-            # Điểm bắt đầu vẽ sao cho TRỌNG TÂM CỦA CHUỖI KÝ TỰ TRÙNG KHÍT VỚI TÂM TRANG GIẤY
-            # p_start = (cx - (L/2)*cos, cy - (L/2)*sin)
-            p_start = pymupdf.Point(cx - (actual_tlen / 2.0) * cos_a, cy - (actual_tlen / 2.0) * sin_a)
+            # Điểm bắt đầu vẽ sao cho TRỌNG TÂM CỦA CHUỖI KÝ TỰ TRÙNG KHÍT VỚI TÂM TRANG GIẤY (cx, cy)
+            # x_start ở bên trái tâm: cx - (L/2)*cos
+            # y_start ở bên dưới tâm: cy + (L/2)*sin (trong hệ tọa độ PDF, y lớn hơn là ở phía dưới)
+            p_start = pymupdf.Point(cx - (actual_tlen / 2.0) * cos_a, cy + (actual_tlen / 2.0) * sin_a)
 
             page.insert_text(
                 p_start,
