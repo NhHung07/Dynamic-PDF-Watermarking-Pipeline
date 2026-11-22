@@ -1,11 +1,13 @@
 import os
 import re
+import math
 import time
 import socket
 import hashlib
 import uuid
 import json
-from datetime import datetime, timezone
+import urllib.parse
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
 import boto3
@@ -27,13 +29,16 @@ except ImportError:
 # 1. CẤU HÌNH HỆ THỐNG & KHỞI TẠO DỊCH VỤ
 # ==============================================================================
 SERVICE_NAME = "PDF-Watermarking-Microservice"
-SERVICE_VERSION = "2.0.0"
+SERVICE_VERSION = "2.1.0"
 
 DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "sqlite:////tmp/audit.db"
 S3_BUCKET = os.getenv("S3_BUCKET", "uet-pdf-watermark")
 EFS_DIR = os.getenv("EFS_DIR", "/mnt/efs")
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 API_KEY = os.getenv("API_KEY", "")  # Để trống nếu không yêu cầu xác thực API Key
+
+# Múi giờ Việt Nam (UTC+7 / GMT+7)
+VN_TIMEZONE = timezone(timedelta(hours=7))
 
 # Thiết lập thư mục EFS cache (với fallback cục bộ nếu EFS chưa mount)
 if not os.path.isdir(EFS_DIR) or not os.access(EFS_DIR, os.W_OK):
@@ -83,6 +88,9 @@ def init_and_migrate_db():
                 ("client_id", "VARCHAR(64)"),
                 ("doc_name", "VARCHAR(255)"),
                 ("pages_count", "INTEGER DEFAULT 0"),
+                ("sha256", "VARCHAR(64)"),
+                ("worker_host", "VARCHAR(100)"),
+                ("output_key", "VARCHAR(255)"),
                 ("processing_time_ms", "FLOAT"),
                 ("created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
                 ("student_id", "VARCHAR(64)"),
@@ -95,8 +103,8 @@ def init_and_migrate_db():
                     if c_name not in existing_cols:
                         try:
                             conn.execute(text(f"ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS {c_name} {c_type}"))
-                        except Exception:
-                            pass
+                        except Exception as ex:
+                            print(f"[WARN] ALTER TABLE audit_logs ADD COLUMN {c_name} failed: {ex}")
     except Exception as e:
         print(f"[WARN] Database schema check/migration: {e}")
 
@@ -109,17 +117,69 @@ except Exception as e:
 # 3. FONT UNICODE & CÁC HÀM TIỆN ÍCH HỆ THỐNG
 # ==============================================================================
 FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
 ]
 UNICODE_FONT = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
 
 
-def sanitize_filename(raw_name: str) -> str:
-    """Chuẩn hóa tên tệp, ngăn chặn Path Traversal và ký tự đặc biệt."""
-    base = os.path.splitext(os.path.basename(raw_name))[0]
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", base).strip("_")
+def measure_text_width(text: str, fontsize: float) -> float:
+    """Đo chiều rộng thực tế của chuỗi văn bản theo font Unicode hoặc Helvetica fallback."""
+    try:
+        if UNICODE_FONT and os.path.exists(UNICODE_FONT):
+            font_obj = pymupdf.Font(fontfile=UNICODE_FONT)
+            return font_obj.text_length(text, fontsize=fontsize)
+    except Exception:
+        pass
+    try:
+        return pymupdf.get_text_length(text, fontname="helv", fontsize=fontsize)
+    except Exception:
+        return len(text) * fontsize * 0.6
+
+
+def clean_doc_title(raw_name: str) -> str:
+    """
+    Chuẩn hóa tên tài liệu người dùng đọc được (Display Name):
+    Giữ nguyên tiếng Việt có dấu, khoảng trắng, dấu chấm, loại bỏ ký tự điều khiển hoặc path traversal.
+    """
+    base = os.path.splitext(os.path.basename(raw_name))[0].strip()
+    # Loại bỏ các ký tự nguy hiểm cho hệ thống tệp và tiêu đề HTTP: / \ : * ? " < > | \0
+    cleaned = re.sub(r'[\/\\:\*\?"<>\|\x00-\x1f]', '_', base).strip()
     return cleaned or f"doc_{int(time.time())}"
+
+
+def safe_storage_key(raw_name: str) -> str:
+    """
+    Chuyển đổi tên tệp thành chuỗi ASCII an toàn cho S3 Object Key và cache đường dẫn nội bộ.
+    Giữ nguyên ý nghĩa bằng cách chuyển tiếng Việt có dấu sang không dấu (e.g. Trần Nhật Hưng -> Tran_Nhat_Hung).
+    """
+    import unicodedata
+    base = os.path.splitext(os.path.basename(raw_name))[0].strip()
+    nfkd = unicodedata.normalize('NFKD', base)
+    ascii_base = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    cleaned = re.sub(r'[^a-zA-Z0-9_-]+', '_', ascii_base).strip('_')
+    return cleaned or f"doc_{int(time.time())}"
+
+
+def sanitize_filename(raw_name: str) -> str:
+    """Tương thích ngược với các lệnh gọi cũ."""
+    return safe_storage_key(raw_name)
+
+
+def format_vn_time(dt: Optional[datetime]) -> str:
+    """Định dạng thời gian theo múi giờ Việt Nam (UTC+7) chuẩn YYYY-MM-DD HH:mm:ss."""
+    if not dt:
+        return "-"
+    try:
+        if dt.tzinfo is None:
+            # Coi như UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_vn = dt.astimezone(VN_TIMEZONE)
+        return dt_vn.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(dt)
 
 
 def list_available_docs() -> list[str]:
@@ -172,6 +232,7 @@ def record_audit(
             "sha256_hash": sha256_hash,
             "file_hash": sha256_hash,
             "worker_host": worker_host,
+            "worker": worker_host,
             "output_key": output_key,
             "s3_key": output_key,
             "processing_time_ms": proc_time_ms,
@@ -209,7 +270,8 @@ def apply_watermarks(
 ) -> tuple[int, str]:
     """
     Thực hiện chèn watermark động lên toàn bộ trang PDF bằng PyMuPDF.
-    Hỗ trợ: Header, Footer, Diagonal chữ chéo, Con dấu Stamp hoặc Logo ảnh.
+    Đặc biệt xử lý watermark chéo: Tự động căn chính giữa trang và co giãn font
+    linh hoạt theo kích thước trang giấy (A4, Letter, Khổ dọc/ngang), đảm bảo không bao giờ bị cắt chữ.
     Trả về: (số trang, chuỗi băm SHA-256).
     """
     font_kwargs = {"fontfile": UNICODE_FONT, "fontname": "unicode_font"} if UNICODE_FONT else {}
@@ -227,19 +289,47 @@ def apply_watermarks(
         rect = page.rect
         w, h = rect.width, rect.height
 
-        # 1. Chèn Watermark chữ chéo chìm (Diagonal Watermark)
+        # 1. Chèn Watermark chữ chéo chìm (Tự thích ứng kích thước & căn chính giữa trang)
         if diagonal_text:
-            center_x = w * 0.18
-            center_y = h * 0.55
-            morph_point = pymupdf.Point(center_x, center_y)
-            rot_matrix = pymupdf.Matrix(-42)
+            angle_deg = -38.0  # Độ nghiêng hướng chéo lên từ góc dưới-trái sang trên-phải
+            rad = math.radians(angle_deg)
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+
+            # Tính chiều dài khả dụng tối đa dọc theo hướng nghiêng để chữ không chạm mép giấy
+            # Ray: x(t) = w/2 + t*cos, y(t) = h/2 + t*sin => |t| <= (w/2)/|cos| và |t| <= (h/2)/|sin|
+            t_max = min((w * 0.44) / max(0.001, abs(cos_a)), (h * 0.44) / max(0.001, abs(sin_a)))
+            max_allowed_len = 2.0 * t_max * 0.88  # Chừa 12% lề an toàn
+
+            # Ước lượng độ dài văn bản tại cỡ chữ 10pt
+            test_len = measure_text_width(diagonal_text, 10.0)
+            if not test_len or test_len <= 0:
+                test_len = len(diagonal_text) * 6.0
+
+            # Tính font size tối ưu
+            target_fs = int((max_allowed_len / test_len) * 10.0)
+            fs = max(13, min(diagonal_fontsize, target_fs))
+
+            # Tinh chỉnh lại cỡ chữ nếu văn bản thực tế vẫn vượt quá giới hạn an toàn
+            actual_tlen = measure_text_width(diagonal_text, fs)
+            while actual_tlen > max_allowed_len and fs > 12:
+                fs -= 1
+                actual_tlen = measure_text_width(diagonal_text, fs)
+
+            # Điểm tâm chính xác của trang giấy
+            cx, cy = w / 2.0, h / 2.0
+
+            # Điểm bắt đầu vẽ sao cho TRỌNG TÂM CỦA CHUỖI KÝ TỰ TRÙNG KHÍT VỚI TÂM TRANG GIẤY
+            # p_start = (cx - (L/2)*cos, cy - (L/2)*sin)
+            p_start = pymupdf.Point(cx - (actual_tlen / 2.0) * cos_a, cy - (actual_tlen / 2.0) * sin_a)
+
             page.insert_text(
-                morph_point,
+                p_start,
                 diagonal_text,
-                fontsize=diagonal_fontsize,
+                fontsize=fs,
                 color=diagonal_color,
                 fill_opacity=diagonal_opacity,
-                morph=(morph_point, rot_matrix),
+                morph=(p_start, pymupdf.Matrix(angle_deg)),
                 **font_kwargs,
             )
 
@@ -378,8 +468,9 @@ async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Hea
 
     # 1. Xác định file PDF đầu vào
     doc_identifier = req.source.doc_code or req.source.s3_key or "document"
-    clean_name = sanitize_filename(doc_identifier)
-    cached_input_path = os.path.join(EFS_DIR, "input", f"{clean_name}.pdf")
+    display_doc_name = clean_doc_title(doc_identifier)
+    storage_code = safe_storage_key(doc_identifier)
+    cached_input_path = os.path.join(EFS_DIR, "input", f"{storage_code}.pdf")
 
     if req.source.base64_content:
         import base64
@@ -392,12 +483,12 @@ async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Hea
     else:
         # Nếu chưa có ở cache EFS thì kéo từ S3 về
         if not os.path.exists(cached_input_path):
-            s3_key = req.source.s3_key or f"input/{clean_name}.pdf"
+            s3_key = req.source.s3_key or f"input/{storage_code}.pdf"
             try:
                 s3_client.download_file(S3_BUCKET, s3_key, cached_input_path)
             except Exception as e:
                 # Fallback: kiểm tra tệp cục bộ
-                local_fallback = f"{clean_name}.pdf"
+                local_fallback = f"{storage_code}.pdf"
                 if os.path.exists(local_fallback):
                     import shutil
                     shutil.copyfile(local_fallback, cached_input_path)
@@ -405,7 +496,7 @@ async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Hea
                     raise HTTPException(status_code=404, detail=f"Không tìm thấy tài liệu '{s3_key}' trên S3/EFS: {e}")
 
     # 2. Xử lý đóng dấu
-    out_filename = f"{clean_name}_{request_id[:8]}_{timestamp}.pdf"
+    out_filename = f"{storage_code}_{request_id[:8]}_{timestamp}.pdf"
     local_out_path = os.path.join("/tmp/wm_work", out_filename)
 
     try:
@@ -422,13 +513,23 @@ async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Hea
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý đóng dấu PDF: {e}")
 
-    # 3. Tải lên S3 & Tạo Pre-signed URL (hoặc link cục bộ nếu S3 offline)
+    # 3. Tải lên S3 & Tạo Pre-signed URL hỗ trợ tên tải về chuẩn UTF-8
     output_key = f"output/{out_filename}"
-    presigned_url = f"/api/v1/download/{out_filename}"
+    download_filename = f"{display_doc_name}_watermarked.pdf"
+    encoded_download_name = urllib.parse.quote(download_filename)
+    content_disp = f"attachment; filename=\"watermarked.pdf\"; filename*=UTF-8''{encoded_download_name}"
+
+    presigned_url = f"/api/v1/download/{out_filename}?original_name={encoded_download_name}"
     try:
         s3_client.upload_file(local_out_path, S3_BUCKET, output_key)
         presigned_url = s3_client.generate_presigned_url(
-            "get_object", Params={"Bucket": S3_BUCKET, "Key": output_key}, ExpiresIn=3600
+            "get_object",
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": output_key,
+                "ResponseContentDisposition": content_disp,
+            },
+            ExpiresIn=3600,
         )
         if os.path.exists(local_out_path):
             os.remove(local_out_path)
@@ -441,12 +542,13 @@ async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Hea
     record_audit(
         request_id=request_id,
         client_id=req.client_id or "default",
-        doc_name=clean_name,
+        doc_name=display_doc_name,
         pages_count=pages_count,
         sha256_hash=digest,
         worker_host=worker_host,
         output_key=output_key,
         proc_time_ms=proc_time_ms,
+        doc_code=storage_code,
         meta_dict=req.metadata,
     )
 
@@ -454,7 +556,7 @@ async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Hea
         request_id=request_id,
         client_id=req.client_id or "default",
         worker_host=worker_host,
-        doc_name=clean_name,
+        doc_name=display_doc_name,
         pages_count=pages_count,
         sha256=digest,
         download_url=presigned_url,
@@ -516,9 +618,10 @@ async def create_watermark_legacy(
         pdf_bytes = await pdf_file.read()
         if not pdf_bytes:
             raise HTTPException(status_code=400, detail="Tệp PDF tải lên bị rỗng.")
-        doc_code = sanitize_filename(pdf_file.filename)
-        input_key = f"input/{doc_code}.pdf"
-        cached_input_path = os.path.join(EFS_DIR, "input", f"{doc_code}.pdf")
+        display_doc_name = clean_doc_title(pdf_file.filename)
+        storage_code = safe_storage_key(pdf_file.filename)
+        input_key = f"input/{storage_code}.pdf"
+        cached_input_path = os.path.join(EFS_DIR, "input", f"{storage_code}.pdf")
         with open(cached_input_path, "wb") as f:
             f.write(pdf_bytes)
         try:
@@ -526,16 +629,17 @@ async def create_watermark_legacy(
         except Exception:
             pass
     else:
-        doc_code = sanitize_filename(doc_code)
-        input_key = f"input/{doc_code}.pdf"
-        cached_input_path = os.path.join(EFS_DIR, "input", f"{doc_code}.pdf")
+        display_doc_name = clean_doc_title(doc_code)
+        storage_code = safe_storage_key(doc_code)
+        input_key = f"input/{storage_code}.pdf"
+        cached_input_path = os.path.join(EFS_DIR, "input", f"{storage_code}.pdf")
         if not os.path.exists(cached_input_path):
             try:
                 s3_client.head_object(Bucket=S3_BUCKET, Key=input_key)
                 s3_client.download_file(S3_BUCKET, input_key, cached_input_path)
             except Exception:
                 # Fallback file cục bộ
-                local_f = f"{doc_code}.pdf"
+                local_f = f"{storage_code}.pdf"
                 if os.path.exists(local_f):
                     import shutil
                     shutil.copyfile(local_f, cached_input_path)
@@ -551,7 +655,7 @@ async def create_watermark_legacy(
 
     # 3. Đóng dấu
     prefix = student_id or client_id or "doc"
-    out_filename = f"{prefix}_{doc_code}_{timestamp}.pdf"
+    out_filename = f"{prefix}_{storage_code}_{timestamp}.pdf"
     local_out_path = os.path.join("/tmp/wm_work", out_filename)
 
     try:
@@ -567,13 +671,23 @@ async def create_watermark_legacy(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý đóng dấu PDF: {e}")
 
-    # 4. Upload S3 & Sinh Pre-signed URL
+    # 4. Upload S3 & Sinh Pre-signed URL hỗ trợ tên tải về chuẩn UTF-8
     output_key = f"output/{out_filename}"
-    presigned_url = f"/api/v1/download/{out_filename}"
+    download_filename = f"{display_doc_name}_watermarked.pdf"
+    encoded_download_name = urllib.parse.quote(download_filename)
+    content_disp = f"attachment; filename=\"watermarked.pdf\"; filename*=UTF-8''{encoded_download_name}"
+
+    presigned_url = f"/api/v1/download/{out_filename}?original_name={encoded_download_name}"
     try:
         s3_client.upload_file(local_out_path, S3_BUCKET, output_key)
         presigned_url = s3_client.generate_presigned_url(
-            "get_object", Params={"Bucket": S3_BUCKET, "Key": output_key}, ExpiresIn=3600
+            "get_object",
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": output_key,
+                "ResponseContentDisposition": content_disp,
+            },
+            ExpiresIn=3600,
         )
         if os.path.exists(local_out_path):
             os.remove(local_out_path)
@@ -586,7 +700,7 @@ async def create_watermark_legacy(
     record_audit(
         request_id=request_id,
         client_id=client_id or "web-client",
-        doc_name=doc_code,
+        doc_name=display_doc_name,
         pages_count=pages_count,
         sha256_hash=digest,
         worker_host=worker_host,
@@ -594,15 +708,15 @@ async def create_watermark_legacy(
         proc_time_ms=proc_time_ms,
         student_id=student_id,
         full_name=full_name,
-        doc_code=doc_code,
+        doc_code=storage_code,
     )
 
     # Trả về JSON bao gồm tất cả các trường mà load_test.py lẫn client mới đều hiểu
     return {
         "request_id": request_id,
         "worker_host": worker_host,
-        "doc_code": doc_code,
-        "doc_name": doc_code,
+        "doc_code": storage_code,
+        "doc_name": display_doc_name,
         "pages_count": pages_count,
         "sha256": digest,
         "download_url": presigned_url,
@@ -620,7 +734,7 @@ def get_audit_logs(
     client_id: Optional[str] = None,
     sha256: Optional[str] = None,
 ):
-    """Truy vấn danh sách nhật ký kiểm toán với bộ lọc linh hoạt."""
+    """Truy vấn danh sách nhật ký kiểm toán với bộ lọc linh hoạt và chuyển đổi giờ Việt Nam."""
     try:
         actual_limit = int(limit) if isinstance(limit, (int, str)) and str(limit).isdigit() else 50
         actual_offset = int(offset) if isinstance(offset, (int, str)) and str(offset).isdigit() else 0
@@ -630,7 +744,7 @@ def get_audit_logs(
             if not insp.has_table("audit_logs"):
                 return {"total": 0, "logs": []}
             existing_cols = {c["name"] for c in insp.get_columns("audit_logs")}
-            
+
             where_clauses = ["1=1"]
             params = {"lim": actual_limit, "off": actual_offset}
             if client_id and isinstance(client_id, str) and "client_id" in existing_cols:
@@ -648,8 +762,16 @@ def get_audit_logs(
             logs_list = []
             for r in results:
                 d = dict(r._mapping)
-                if isinstance(d.get("created_at"), datetime):
-                    d["created_at"] = d["created_at"].isoformat()
+                raw_dt = d.get("created_at")
+                if isinstance(raw_dt, datetime):
+                    d["created_at"] = raw_dt.isoformat()
+                    d["created_at_vn"] = format_vn_time(raw_dt)
+                else:
+                    d["created_at_vn"] = str(raw_dt or "-")
+
+                # Chuẩn hóa trường để không bao giờ bị undefined trên frontend
+                d["sha256"] = d.get("sha256") or d.get("sha256_hash") or d.get("file_hash") or ""
+                d["worker_host"] = d.get("worker_host") or d.get("worker") or socket.gethostname()
                 logs_list.append(d)
             return {"total": len(logs_list), "logs": logs_list}
     except Exception as e:
@@ -668,7 +790,7 @@ def verify_document_integrity(sha256: str):
             if not insp.has_table("audit_logs"):
                 return {"verified": False, "sha256": sha256, "message": "Chưa có bảng dữ liệu kiểm toán."}
             existing_cols = {c["name"] for c in insp.get_columns("audit_logs")}
-            
+
             col_match = next((c for c in ["sha256", "sha256_hash", "file_hash"] if c in existing_cols), None)
             if not col_match:
                 return {"verified": False, "sha256": sha256, "message": "Cột mã băm kiểm định chưa được thiết lập."}
@@ -682,8 +804,16 @@ def verify_document_integrity(sha256: str):
                     "message": "Không tìm thấy tài liệu này trong nhật ký kiểm toán! File có thể bị giả mạo hoặc chưa từng được cấp phát.",
                 }
             data = dict(row._mapping)
-            if isinstance(data.get("created_at"), datetime):
-                data["created_at"] = data["created_at"].isoformat()
+            raw_dt = data.get("created_at")
+            if isinstance(raw_dt, datetime):
+                data["created_at"] = raw_dt.isoformat()
+                data["created_at_vn"] = format_vn_time(raw_dt)
+            else:
+                data["created_at_vn"] = str(raw_dt or "-")
+
+            data["sha256"] = data.get("sha256") or data.get("sha256_hash") or data.get("file_hash") or ""
+            data["worker_host"] = data.get("worker_host") or data.get("worker") or socket.gethostname()
+
             return {
                 "verified": True,
                 "sha256": sha256,
@@ -695,13 +825,21 @@ def verify_document_integrity(sha256: str):
 
 
 @app.get("/api/v1/download/{filename}")
-def download_local_file(filename: str):
-    """Tải trực tiếp file từ thư mục tạm làm việc (hữu ích khi test cục bộ không có S3)."""
+def download_local_file(filename: str, original_name: Optional[str] = None):
+    """Tải trực tiếp file từ thư mục tạm làm việc với tiêu đề tên tệp UTF-8."""
     clean = os.path.basename(filename)
     path = os.path.join("/tmp/wm_work", clean)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Tệp tin không tồn tại hoặc đã bị dọn dẹp.")
-    return FileResponse(path, media_type="application/pdf", filename=clean)
+
+    final_name = original_name or clean
+    if not final_name.lower().endswith(".pdf"):
+        final_name += ".pdf"
+    encoded_name = urllib.parse.quote(final_name)
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"document.pdf\"; filename*=UTF-8''{encoded_name}"
+    }
+    return FileResponse(path, media_type="application/pdf", headers=headers)
 
 
 # ==============================================================================
@@ -723,7 +861,7 @@ def developer_portal():
     :root {{ --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --border: #e2e8f0; }}
     * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }}
     body {{ background: var(--bg); margin: 0; padding: 24px 16px; color: var(--text); }}
-    .container {{ max-width: 900px; margin: 0 auto; }}
+    .container {{ max-width: 960px; margin: 0 auto; }}
     .header {{ background: var(--card); border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); margin-bottom: 20px; border: 1px solid var(--border); }}
     .header h1 {{ margin: 0 0 6px; font-size: 24px; color: #1e3a8a; display: flex; align-items: center; gap: 10px; }}
     .header p {{ margin: 0; font-size: 14px; color: #64748b; }}
@@ -760,7 +898,7 @@ def developer_portal():
 <body>
   <div class="container">
     <div class="header">
-      <h1>Enterprise PDF Watermarking Engine <span class="badge">v2.0 Microservice</span></h1>
+      <h1>Enterprise PDF Watermarking Engine <span class="badge">v2.1 Microservice</span></h1>
       <p>Microservice đóng dấu tài liệu động, kiểm định tính toàn vẹn (SHA-256) và kiểm toán phân tán trên AWS Cloud.</p>
     </div>
 
@@ -787,7 +925,7 @@ def developer_portal():
         <div class="field">
           <label>Chữ chìm chéo giữa trang (Diagonal Watermark) 🌟</label>
           <input type="text" name="diagonal_text" value="BẢN SAO KÊ BẢO MẬT - NGUYỄN VĂN A" placeholder="VD: CONFIDENTIAL, DRAFT, TÊN KHÁCH HÀNG" />
-          <div class="hint">Watermark chìm trong suốt xoay góc -42 độ phủ khắp từng trang tài liệu.</div>
+          <div class="hint">Watermark chìm xoay chéo tự thích ứng kích thước trang giấy, tự động co giãn font và luôn hiển thị trọn vẹn ở giữa trang.</div>
         </div>
 
         <div class="grid">
@@ -836,7 +974,7 @@ def developer_portal():
       <div id="verifyResult" style="margin-bottom: 20px;"></div>
 
       <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h4 style="margin: 0;">50 Bản ghi Kiểm toán gần nhất</h4>
+        <h4 style="margin: 0;">50 Bản ghi Kiểm toán gần nhất (Giờ Việt Nam - GMT+7)</h4>
         <button onclick="loadAuditLogs()" style="background: none; border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor: pointer;">🔄 Làm mới</button>
       </div>
       <div style="overflow-x: auto;">
@@ -844,7 +982,7 @@ def developer_portal():
           <thead>
             <tr>
               <th>ID</th>
-              <th>Thời gian</th>
+              <th>Thời gian (VN)</th>
               <th>Client ID</th>
               <th>Tài liệu</th>
               <th>Số trang</th>
@@ -893,6 +1031,27 @@ def developer_portal():
       if (tab === 'audit') loadAuditLogs();
     }}
 
+    function formatVNTime(isoStr) {{
+      if (!isoStr || isoStr === '-') return '-';
+      try {{
+        let s = isoStr;
+        if (!s.endsWith('Z') && !s.includes('+')) s += 'Z';
+        const d = new Date(s);
+        return d.toLocaleString('vi-VN', {{
+          timeZone: 'Asia/Ho_Chi_Minh',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        }});
+      }} catch (e) {{
+        return isoStr.substring(0, 19).replace('T', ' ');
+      }}
+    }}
+
     // Xử lý gửi Form đóng dấu
     const form = document.getElementById('wmForm');
     const btn = document.getElementById('submitBtn');
@@ -922,8 +1081,8 @@ def developer_portal():
           resBox.innerHTML = `
             <div class="meta-item">
               <strong>Trạng thái:</strong> ✅ Đóng dấu hoàn tất thành công!<br/>
-              <strong>EC2 Worker thực thi:</strong> <code>${{data.worker_host}}</code><br/>
-              <strong>Tài liệu:</strong> <code>${{data.doc_code}}.pdf</code> (${{data.pages_count}} trang)<br/>
+              <strong>EC2 Worker thực thi:</strong> <code>${{data.worker_host || 'ec2-worker'}}</code><br/>
+              <strong>Tài liệu:</strong> <code>${{data.doc_name}}.pdf</code> (${{data.pages_count}} trang)<br/>
               <strong>Thời gian xử lý:</strong> <code>${{data.processing_time_ms}} ms</code><br/>
               <strong>Mã băm SHA-256 định danh:</strong> <code>${{data.sha256}}</code>
             </div>
@@ -951,18 +1110,23 @@ def developer_portal():
           tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #64748b;">Chưa có bản ghi kiểm toán nào.</td></tr>';
           return;
         }}
-        tbody.innerHTML = data.logs.map(l => `
+        tbody.innerHTML = data.logs.map(l => {{
+          const sha = l.sha256 || l.sha256_hash || '-';
+          const worker = l.worker_host || l.worker || '-';
+          const timeVN = l.created_at_vn || formatVNTime(l.created_at);
+          return `
           <tr>
             <td>#${{l.id}}</td>
-            <td>${{l.created_at ? l.created_at.substring(0, 19).replace('T', ' ') : '-'}}</td>
+            <td><b>${{timeVN}}</b></td>
             <td><code>${{l.client_id || 'default'}}</code></td>
-            <td>${{l.doc_name}}</td>
+            <td title="${{l.doc_name}}">${{l.doc_name}}</td>
             <td>${{l.pages_count || 0}}</td>
-            <td><small><code>${{l.worker_host}}</code></small></td>
+            <td><small><code>${{worker}}</code></small></td>
             <td>${{l.processing_time_ms ? l.processing_time_ms.toFixed(1) + ' ms' : '-'}}</td>
-            <td title="${{l.sha256}}"><code>${{l.sha256 ? l.sha256.substring(0, 14) + '...' : '-'}}</code></td>
+            <td title="${{sha}}"><code>${{sha && sha !== '-' ? sha.substring(0, 14) + '...' : '-'}}</code></td>
           </tr>
-        `).join('');
+          `;
+        }}).join('');
       }} catch (err) {{
         tbody.innerHTML = `<tr><td colspan="8" style="color: red; text-align: center;">Lỗi tải dữ liệu: ${{err.message}}</td></tr>`;
       }}
@@ -973,15 +1137,25 @@ def developer_portal():
       const hash = document.getElementById('verifyShaInput').value.trim();
       const resDiv = document.getElementById('verifyResult');
       if (!hash) return;
-      resDiv.innerHTML = 'Đang tra cứu cơ sở dữ liệu...';
+      resDiv.innerHTML = 'Đang tra cứu cơ sở dữ liệu kiểm toán...';
       try {{
         const resp = await fetch(`/api/v1/audit-logs/verify/${{hash}}`);
         const data = await resp.json();
         if (data.verified) {{
+          const doc = data.document;
+          const timeVN = doc.created_at_vn || formatVNTime(doc.created_at);
+          const worker = doc.worker_host || doc.worker || 'ec2-worker';
+          const sha = doc.sha256 || doc.sha256_hash || hash;
           resDiv.innerHTML = `
-            <div style="background: #ecfdf5; border: 1px solid #10b981; padding: 12px; border-radius: 8px;">
-              <strong style="color: #065f46;">✅ TÀI LIỆU CHÍNH THỐNG:</strong> ${{data.message}}<br/>
-              <small>Client: <b>${{data.document.client_id}}</b> | Tài liệu: <b>${{data.document.doc_name}}</b> | Thời gian cấp: <b>${{data.document.created_at}}</b> | Máy chủ xử lý: <b>${{data.document.worker_host}}</b></small>
+            <div style="background: #ecfdf5; border: 1px solid #10b981; padding: 16px; border-radius: 8px;">
+              <strong style="color: #065f46; font-size: 15px;">✅ TÀI LIỆU CHÍNH THỐNG:</strong> ${{data.message}}<br/>
+              <div style="margin-top: 8px; font-size: 13px; line-height: 1.8; color: #1e293b;">
+                • <b>Hệ thống cấp phát (Client ID):</b> <code>${{doc.client_id || 'default'}}</code><br/>
+                • <b>Tài liệu gốc:</b> <code>${{doc.doc_name}}</code> (${{doc.pages_count || 0}} trang)<br/>
+                • <b>Thời gian cấp (Giờ Việt Nam):</b> <b>${{timeVN}}</b><br/>
+                • <b>Máy chủ EC2 thực thi:</b> <code>${{worker}}</code><br/>
+                • <b>Mã băm SHA-256 kiểm định:</b> <code style="word-break: break-all;">${{sha}}</code>
+              </div>
             </div>
           `;
         }} else {{
