@@ -3,13 +3,19 @@ import re
 import time
 import socket
 import hashlib
-from typing import Optional
+import uuid
+import json
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
 
 import boto3
-import pymupdf as fitz
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
-from sqlalchemy import create_engine, inspect, text
+from botocore.exceptions import ClientError
+import pymupdf
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header, Query, Request
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+import sqlalchemy as sa
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Float, DateTime, select, desc, text
 
 try:
     from dotenv import load_dotenv
@@ -17,22 +23,62 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="Dynamic PDF Watermarking Pipeline - UET")
+# ==============================================================================
+# 1. CẤU HÌNH HỆ THỐNG & KHỞI TẠO DỊCH VỤ
+# ==============================================================================
+SERVICE_NAME = "PDF-Watermarking-Microservice"
+SERVICE_VERSION = "2.0.0"
 
 DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "sqlite:////tmp/audit.db"
 S3_BUCKET = os.getenv("S3_BUCKET", "uet-pdf-watermark")
 EFS_DIR = os.getenv("EFS_DIR", "/mnt/efs")
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
+API_KEY = os.getenv("API_KEY", "")  # Để trống nếu không yêu cầu xác thực API Key
 
+# Thiết lập thư mục EFS cache (với fallback cục bộ nếu EFS chưa mount)
 if not os.path.isdir(EFS_DIR) or not os.access(EFS_DIR, os.W_OK):
     EFS_DIR = "/tmp/watermark_efs_fallback"
 
 os.makedirs(os.path.join(EFS_DIR, "input"), exist_ok=True)
 os.makedirs("/tmp/wm_work", exist_ok=True)
 
+# Khởi tạo kết nối SQLAlchemy & Boto3 S3
 engine = create_engine(DB_URL, pool_pre_ping=True)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 
+# ==============================================================================
+# 2. TỰ ĐỘNG KHỞI TẠO CƠ SỞ DỮ LIỆU AUDIT LOGS (SCHEMA QUẢN TRỊ MICROSERVICE)
+# ==============================================================================
+metadata = MetaData()
+audit_logs = Table(
+    "audit_logs",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("request_id", String(64), index=True),
+    Column("client_id", String(64), index=True, default="default"),
+    Column("doc_name", String(255)),
+    Column("pages_count", Integer, default=0),
+    Column("sha256", String(64), index=True),
+    Column("worker_host", String(100)),
+    Column("output_key", String(255)),
+    Column("processing_time_ms", Float),
+    Column("created_at", DateTime, default=lambda: datetime.now(timezone.utc)),
+    # Các trường mở rộng & tương thích ngược với đề tài cũ
+    Column("student_id", String(64), nullable=True),
+    Column("full_name", String(128), nullable=True),
+    Column("doc_code", String(128), nullable=True),
+    Column("metadata_json", String(1024), nullable=True),
+)
+
+# Tự động tạo bảng nếu chưa có (Tương thích cả SQLite, MySQL và PostgreSQL RDS)
+try:
+    metadata.create_all(engine)
+except Exception as e:
+    print(f"[WARN] Database schema auto-creation skipped or failed: {e}")
+
+# ==============================================================================
+# 3. FONT UNICODE & CÁC HÀM TIỆN ÍCH HỆ THỐNG
+# ==============================================================================
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -40,154 +86,753 @@ FONT_CANDIDATES = [
 UNICODE_FONT = next((p for p in FONT_CANDIDATES if os.path.exists(p)), None)
 
 
-def sanitize_code(raw_name: str) -> str:
-    base = os.path.splitext(raw_name)[0]
+def sanitize_filename(raw_name: str) -> str:
+    """Chuẩn hóa tên tệp, ngăn chặn Path Traversal và ký tự đặc biệt."""
+    base = os.path.splitext(os.path.basename(raw_name))[0]
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", base).strip("_")
     return cleaned or f"doc_{int(time.time())}"
 
 
 def list_available_docs() -> list[str]:
+    """Lấy danh sách các file PDF mẫu có sẵn trên S3 hoặc EFS."""
     docs = []
+    # 1. Thử lấy từ S3
     try:
-        resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix="input/")
+        resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix="input/", MaxKeys=30)
         for obj in resp.get("Contents", []):
             key = obj["Key"]
             if key.lower().endswith(".pdf"):
                 docs.append(os.path.splitext(os.path.basename(key))[0])
     except Exception:
         pass
-    return docs or ["ModelOptimization", "giaotrinh_301"]
+    # 2. Thử lấy từ EFS cache hoặc thư mục hiện tại
+    if not docs:
+        for f in os.listdir("."):
+            if f.lower().endswith(".pdf"):
+                docs.append(os.path.splitext(f)[0])
+    return list(dict.fromkeys(docs)) or ["ModelOptimization"]
 
 
-def log_audit(student_id: str, full_name: str, doc_code: str, sha256_hash: str, worker_host: str, output_key: str):
+def record_audit(
+    request_id: str,
+    client_id: str,
+    doc_name: str,
+    pages_count: int,
+    sha256_hash: str,
+    worker_host: str,
+    output_key: str,
+    proc_time_ms: float,
+    student_id: Optional[str] = None,
+    full_name: Optional[str] = None,
+    doc_code: Optional[str] = None,
+    meta_dict: Optional[dict] = None,
+):
+    """Ghi vết kiểm toán chuẩn Microservice vào cơ sở dữ liệu."""
     try:
-        insp = inspect(engine)
-        if not insp.has_table("audit_logs"):
-            return
-        cols = {c["name"] for c in insp.get_columns("audit_logs")}
-        candidate_values = {
-            "student_id": student_id,
-            "full_name": full_name,
-            "doc_code": doc_code,
-            "sha256": sha256_hash,
-            "file_hash": sha256_hash,
-            "worker_host": worker_host,
-            "output_key": output_key,
-            "s3_key": output_key,
-        }
-        insert_cols = [k for k in candidate_values if k in cols]
-        if not insert_cols:
-            return
-        col_list = ", ".join(insert_cols)
-        val_list = ", ".join(f":{k}" for k in insert_cols)
-        sql = text(f"INSERT INTO audit_logs ({col_list}) VALUES ({val_list})")
         with engine.begin() as conn:
-            conn.execute(sql, {k: candidate_values[k] for k in insert_cols})
+            conn.execute(
+                audit_logs.insert().values(
+                    request_id=request_id,
+                    client_id=client_id or "default",
+                    doc_name=doc_name,
+                    pages_count=pages_count,
+                    sha256=sha256_hash,
+                    worker_host=worker_host,
+                    output_key=output_key,
+                    processing_time_ms=proc_time_ms,
+                    created_at=datetime.now(timezone.utc),
+                    student_id=student_id,
+                    full_name=full_name,
+                    doc_code=doc_code or doc_name,
+                    metadata_json=json.dumps(meta_dict) if meta_dict else None,
+                )
+            )
     except Exception as e:
-        print(f"[WARN] Audit log insert skipped: {e}")
+        print(f"[WARN] Failed to insert audit log: {e}")
+
+
+# ==============================================================================
+# 4. BỘ MÁY ĐÓNG DẤU PDF NÂNG CAO (GENERIC WATERMARKING ENGINE)
+# ==============================================================================
+def apply_watermarks(
+    input_path: str,
+    output_path: str,
+    header_text: Optional[str] = None,
+    footer_text: Optional[str] = None,
+    diagonal_text: Optional[str] = None,
+    stamp_text: Optional[str] = None,
+    logo_bytes: Optional[bytes] = None,
+    diagonal_opacity: float = 0.22,
+    diagonal_fontsize: int = 38,
+    diagonal_color: tuple = (0.75, 0.2, 0.2),
+) -> tuple[int, str]:
+    """
+    Thực hiện chèn watermark động lên toàn bộ trang PDF bằng PyMuPDF.
+    Hỗ trợ: Header, Footer, Diagonal chữ chéo, Con dấu Stamp hoặc Logo ảnh.
+    Trả về: (số trang, chuỗi băm SHA-256).
+    """
+    font_kwargs = {"fontfile": UNICODE_FONT, "fontname": "unicode_font"} if UNICODE_FONT else {}
+
+    doc = pymupdf.open(input_path)
+    pages_count = len(doc)
+
+    # Đảm bảo các tham số text là chuỗi hợp lệ
+    header_text = header_text if isinstance(header_text, str) and header_text.strip() else None
+    footer_text = footer_text if isinstance(footer_text, str) and footer_text.strip() else None
+    diagonal_text = diagonal_text if isinstance(diagonal_text, str) and diagonal_text.strip() else None
+    stamp_text = stamp_text if isinstance(stamp_text, str) and stamp_text.strip() else None
+
+    for page in doc:
+        rect = page.rect
+        w, h = rect.width, rect.height
+
+        # 1. Chèn Watermark chữ chéo chìm (Diagonal Watermark)
+        if diagonal_text:
+            center_x = w * 0.18
+            center_y = h * 0.55
+            morph_point = pymupdf.Point(center_x, center_y)
+            rot_matrix = pymupdf.Matrix(-42)
+            page.insert_text(
+                morph_point,
+                diagonal_text,
+                fontsize=diagonal_fontsize,
+                color=diagonal_color,
+                fill_opacity=diagonal_opacity,
+                morph=(morph_point, rot_matrix),
+                **font_kwargs,
+            )
+
+        # 2. Chèn Header (Góc trên bên trái)
+        if header_text:
+            page.insert_text(
+                (42, 28),
+                header_text,
+                fontsize=9,
+                color=(0.75, 0.15, 0.15),
+                **font_kwargs,
+            )
+
+        # 3. Chèn Footer (Góc dưới bên trái)
+        if footer_text:
+            page.insert_text(
+                (42, h - 20),
+                footer_text,
+                fontsize=8,
+                color=(0.4, 0.4, 0.4),
+                **font_kwargs,
+            )
+
+        # 4. Chèn Con dấu / Logo (Góc trên bên phải)
+        if logo_bytes:
+            logo_rect = pymupdf.Rect(w - 110, 14, w - 30, 64)
+            page.insert_image(logo_rect, stream=logo_bytes, keep_proportion=True)
+        elif stamp_text:
+            stamp_rect = pymupdf.Rect(w - 130, 16, w - 35, 42)
+            page.draw_rect(stamp_rect, color=(0.8, 0.1, 0.1), width=1.2)
+            page.insert_text(
+                (w - 122, 33),
+                stamp_text[:14],
+                fontsize=9,
+                color=(0.8, 0.1, 0.1),
+                **font_kwargs,
+            )
+
+    # Nén tối đa kích thước PDF đầu ra
+    doc.save(output_path, garbage=3, deflate=True)
+    doc.close()
+
+    # Tính mã băm SHA-256 theo khối 64KB
+    sha256 = hashlib.sha256()
+    with open(output_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha256.update(chunk)
+    digest = sha256.hexdigest()
+
+    return pages_count, digest
+
+
+# ==============================================================================
+# 5. PYDANTIC SCHEMAS CHO RESTFUL JSON API
+# ==============================================================================
+class WatermarkStyle(BaseModel):
+    diagonal_text: Optional[str] = Field(None, description="Chữ chìm chéo giữa trang (VD: CONFIDENTIAL, DRAFT, TÊN KHÁCH HÀNG)")
+    header_text: Optional[str] = Field(None, description="Dòng chữ tiêu đề trang (VD: Mã giao dịch | Ngày xuất)")
+    footer_text: Optional[str] = Field(None, description="Dòng chữ chân trang (VD: Chỉ sử dụng cho mục đích nội bộ)")
+    stamp_text: Optional[str] = Field(None, description="Chữ hiển thị trong khung con dấu góc trên bên phải (VD: ACME CORP)")
+    diagonal_opacity: float = Field(0.22, ge=0.05, le=1.0, description="Độ mờ chữ chéo (0.1 đến 1.0)")
+    diagonal_fontsize: int = Field(38, ge=12, le=72, description="Cỡ chữ watermark chéo")
+
+
+class DocumentSource(BaseModel):
+    s3_key: Optional[str] = Field(None, description="Đường dẫn file trên S3 (VD: input/contract.pdf)")
+    doc_code: Optional[str] = Field(None, description="Tên file tài liệu mẫu có sẵn trên S3 hoặc EFS")
+    base64_content: Optional[str] = Field(None, description="Nội dung file PDF dạng Base64 (tùy chọn)")
+
+
+class WatermarkRequest(BaseModel):
+    client_id: Optional[str] = Field("default", description="Mã định danh hệ thống gọi (VD: crm-service, edtech-app)")
+    source: DocumentSource = Field(..., description="Nguồn tài liệu PDF cần xử lý")
+    watermark: WatermarkStyle = Field(default_factory=WatermarkStyle, description="Cấu hình các lớp đóng dấu")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Metadata đính kèm tự do lưu vào nhật ký kiểm toán")
+
+
+class WatermarkResponse(BaseModel):
+    request_id: str
+    client_id: str
+    worker_host: str
+    doc_name: str
+    pages_count: int
+    sha256: str
+    download_url: str
+    processing_time_ms: float
+
+
+# ==============================================================================
+# 6. KHỞI TẠO ỨNG DỤNG FASTAPI & ENDPOINTS
+# ==============================================================================
+app = FastAPI(
+    title=SERVICE_NAME,
+    version=SERVICE_VERSION,
+    description="Microservice đóng dấu bản quyền tài liệu động, kiểm định tính toàn vẹn (SHA-256) và kiểm toán phân tán trên AWS.",
+)
 
 
 @app.get("/health")
 def health_check():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"status": "healthy", "host": socket.gethostname()}
+    """Endpoint kiểm tra sức khỏe phục vụ Application Load Balancer và Container Health Check."""
+    db_ok = False
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+
+    return {
+        "status": "healthy" if db_ok else "degraded",
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "host": socket.gethostname(),
+        "database": "connected" if db_ok else "disconnected",
+        "storage": {
+            "s3_bucket": S3_BUCKET,
+            "efs_dir": EFS_DIR,
+        },
+    }
 
 
+# ------------------------------------------------------------------------------
+# 6.1. API CHUẨN JSON RESTful DÀNH CHO CÁC MICROSERVICE KHÁC TÍCH HỢP
+# ------------------------------------------------------------------------------
+@app.post("/api/v1/watermark", response_model=WatermarkResponse)
+async def api_watermark_v1(req: WatermarkRequest, x_api_key: Optional[str] = Header(None)):
+    """API JSON chuẩn dành cho các hệ thống khác (CRM, ERP, EdTech) gọi tích hợp đóng dấu."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Xác thực không hợp lệ: API Key không đúng.")
+
+    start_t = time.perf_counter()
+    request_id = str(uuid.uuid4())
+    worker_host = socket.gethostname()
+    timestamp = int(time.time())
+
+    # 1. Xác định file PDF đầu vào
+    doc_identifier = req.source.doc_code or req.source.s3_key or "document"
+    clean_name = sanitize_filename(doc_identifier)
+    cached_input_path = os.path.join(EFS_DIR, "input", f"{clean_name}.pdf")
+
+    if req.source.base64_content:
+        import base64
+        try:
+            pdf_bytes = base64.b64decode(req.source.base64_content)
+            with open(cached_input_path, "wb") as f:
+                f.write(pdf_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Base64 không hợp lệ: {e}")
+    else:
+        # Nếu chưa có ở cache EFS thì kéo từ S3 về
+        if not os.path.exists(cached_input_path):
+            s3_key = req.source.s3_key or f"input/{clean_name}.pdf"
+            try:
+                s3_client.download_file(S3_BUCKET, s3_key, cached_input_path)
+            except Exception as e:
+                # Fallback: kiểm tra tệp cục bộ
+                local_fallback = f"{clean_name}.pdf"
+                if os.path.exists(local_fallback):
+                    import shutil
+                    shutil.copyfile(local_fallback, cached_input_path)
+                else:
+                    raise HTTPException(status_code=404, detail=f"Không tìm thấy tài liệu '{s3_key}' trên S3/EFS: {e}")
+
+    # 2. Xử lý đóng dấu
+    out_filename = f"{clean_name}_{request_id[:8]}_{timestamp}.pdf"
+    local_out_path = os.path.join("/tmp/wm_work", out_filename)
+
+    try:
+        pages_count, digest = apply_watermarks(
+            input_path=cached_input_path,
+            output_path=local_out_path,
+            header_text=req.watermark.header_text,
+            footer_text=req.watermark.footer_text,
+            diagonal_text=req.watermark.diagonal_text,
+            stamp_text=req.watermark.stamp_text,
+            diagonal_opacity=req.watermark.diagonal_opacity,
+            diagonal_fontsize=req.watermark.diagonal_fontsize,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý đóng dấu PDF: {e}")
+
+    # 3. Tải lên S3 & Tạo Pre-signed URL (hoặc link cục bộ nếu S3 offline)
+    output_key = f"output/{out_filename}"
+    presigned_url = f"/api/v1/download/{out_filename}"
+    try:
+        s3_client.upload_file(local_out_path, S3_BUCKET, output_key)
+        presigned_url = s3_client.generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": output_key}, ExpiresIn=3600
+        )
+        if os.path.exists(local_out_path):
+            os.remove(local_out_path)
+    except Exception as e:
+        print(f"[WARN] S3 Upload bypassed / using local download: {e}")
+
+    proc_time_ms = (time.perf_counter() - start_t) * 1000.0
+
+    # 4. Ghi vết kiểm toán
+    record_audit(
+        request_id=request_id,
+        client_id=req.client_id or "default",
+        doc_name=clean_name,
+        pages_count=pages_count,
+        sha256_hash=digest,
+        worker_host=worker_host,
+        output_key=output_key,
+        proc_time_ms=proc_time_ms,
+        meta_dict=req.metadata,
+    )
+
+    return WatermarkResponse(
+        request_id=request_id,
+        client_id=req.client_id or "default",
+        worker_host=worker_host,
+        doc_name=clean_name,
+        pages_count=pages_count,
+        sha256=digest,
+        download_url=presigned_url,
+        processing_time_ms=round(proc_time_ms, 2),
+    )
+
+
+# ------------------------------------------------------------------------------
+# 6.2. ENDPOINT TƯƠNG THÍCH NGƯỢC (TƯƠNG THÍCH CẢ LOAD_TEST.PY & FORM UPLOAD)
+# ------------------------------------------------------------------------------
+@app.post("/api/watermark")
+async def create_watermark_legacy(
+    student_id: Optional[str] = Form(None),
+    full_name: Optional[str] = Form(None),
+    doc_code: str = Form("ModelOptimization"),
+    pdf_file: Optional[UploadFile] = File(None),
+    logo_file: Optional[UploadFile] = File(None),
+    # Các tham số mới mở rộng cho Microservice
+    header_text: Optional[str] = Form(None),
+    footer_text: Optional[str] = Form(None),
+    diagonal_text: Optional[str] = Form(None),
+    stamp_text: Optional[str] = Form(None),
+    client_id: Optional[str] = Form("web-client"),
+):
+    """
+    Endpoint linh hoạt: vừa hỗ trợ form web / upload file trực tiếp, vừa tương thích
+    100% với script bắn tải load_test.py cũ.
+    """
+    start_t = time.perf_counter()
+    request_id = str(uuid.uuid4())
+    worker_host = socket.gethostname()
+    timestamp = int(time.time())
+
+    # Chuẩn hóa giá trị tham số (tránh trường hợp gọi trực tiếp nhận đối tượng Form)
+    student_id = student_id if isinstance(student_id, str) and student_id.strip() else None
+    full_name = full_name if isinstance(full_name, str) and full_name.strip() else None
+    doc_code = doc_code if isinstance(doc_code, str) and doc_code.strip() else "ModelOptimization"
+    header_text = header_text if isinstance(header_text, str) and header_text.strip() else None
+    footer_text = footer_text if isinstance(footer_text, str) and footer_text.strip() else None
+    diagonal_text = diagonal_text if isinstance(diagonal_text, str) and diagonal_text.strip() else None
+    stamp_text = stamp_text if isinstance(stamp_text, str) and stamp_text.strip() else None
+    client_id = client_id if isinstance(client_id, str) and client_id.strip() else "web-client"
+
+    # Xử lý tương thích ngược: Nếu truyền student_id và full_name thì tự động sinh header/footer
+    if student_id and full_name:
+        if not header_text:
+            header_text = f"{student_id} - {full_name.upper()} | {doc_code}"
+        if not footer_text:
+            footer_text = f"Tài liệu cấp phát cho {full_name} ({student_id})"
+        if not diagonal_text:
+            diagonal_text = f"{student_id} - {full_name.upper()}"
+        if not stamp_text:
+            stamp_text = "UET - VNU"
+
+    # 1. Quản lý file PDF đầu vào
+    if pdf_file is not None and pdf_file.filename:
+        if not pdf_file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Chỉ chấp nhận tệp định dạng PDF.")
+        pdf_bytes = await pdf_file.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="Tệp PDF tải lên bị rỗng.")
+        doc_code = sanitize_filename(pdf_file.filename)
+        input_key = f"input/{doc_code}.pdf"
+        cached_input_path = os.path.join(EFS_DIR, "input", f"{doc_code}.pdf")
+        with open(cached_input_path, "wb") as f:
+            f.write(pdf_bytes)
+        try:
+            s3_client.upload_file(cached_input_path, S3_BUCKET, input_key)
+        except Exception:
+            pass
+    else:
+        doc_code = sanitize_filename(doc_code)
+        input_key = f"input/{doc_code}.pdf"
+        cached_input_path = os.path.join(EFS_DIR, "input", f"{doc_code}.pdf")
+        if not os.path.exists(cached_input_path):
+            try:
+                s3_client.head_object(Bucket=S3_BUCKET, Key=input_key)
+                s3_client.download_file(S3_BUCKET, input_key, cached_input_path)
+            except Exception:
+                # Fallback file cục bộ
+                local_f = f"{doc_code}.pdf"
+                if os.path.exists(local_f):
+                    import shutil
+                    shutil.copyfile(local_f, cached_input_path)
+                else:
+                    raise HTTPException(status_code=404, detail=f"Không tìm thấy PDF '{input_key}' trên S3/EFS")
+
+    # 2. Xử lý ảnh logo tải lên (nếu có)
+    logo_bytes = None
+    if logo_file is not None and logo_file.filename:
+        logo_bytes = await logo_file.read()
+        if not logo_bytes:
+            logo_bytes = None
+
+    # 3. Đóng dấu
+    prefix = student_id or client_id or "doc"
+    out_filename = f"{prefix}_{doc_code}_{timestamp}.pdf"
+    local_out_path = os.path.join("/tmp/wm_work", out_filename)
+
+    try:
+        pages_count, digest = apply_watermarks(
+            input_path=cached_input_path,
+            output_path=local_out_path,
+            header_text=header_text,
+            footer_text=footer_text,
+            diagonal_text=diagonal_text,
+            stamp_text=stamp_text or "ACME CORP",
+            logo_bytes=logo_bytes,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi xử lý đóng dấu PDF: {e}")
+
+    # 4. Upload S3 & Sinh Pre-signed URL
+    output_key = f"output/{out_filename}"
+    presigned_url = f"/api/v1/download/{out_filename}"
+    try:
+        s3_client.upload_file(local_out_path, S3_BUCKET, output_key)
+        presigned_url = s3_client.generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": output_key}, ExpiresIn=3600
+        )
+        if os.path.exists(local_out_path):
+            os.remove(local_out_path)
+    except Exception as e:
+        print(f"[WARN] S3 Upload bypassed / using local download: {e}")
+
+    proc_time_ms = (time.perf_counter() - start_t) * 1000.0
+
+    # 5. Ghi nhật ký kiểm toán
+    record_audit(
+        request_id=request_id,
+        client_id=client_id or "web-client",
+        doc_name=doc_code,
+        pages_count=pages_count,
+        sha256_hash=digest,
+        worker_host=worker_host,
+        output_key=output_key,
+        proc_time_ms=proc_time_ms,
+        student_id=student_id,
+        full_name=full_name,
+        doc_code=doc_code,
+    )
+
+    # Trả về JSON bao gồm tất cả các trường mà load_test.py lẫn client mới đều hiểu
+    return {
+        "request_id": request_id,
+        "worker_host": worker_host,
+        "doc_code": doc_code,
+        "doc_name": doc_code,
+        "pages_count": pages_count,
+        "sha256": digest,
+        "download_url": presigned_url,
+        "processing_time_ms": round(proc_time_ms, 2),
+    }
+
+
+# ------------------------------------------------------------------------------
+# 6.3. API KIỂM TOÁN & TRA CỨU TÍNH TOÀN VẸN (AUDIT & INTEGRITY VERIFICATION)
+# ------------------------------------------------------------------------------
+@app.get("/api/v1/audit-logs")
+def get_audit_logs(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    client_id: Optional[str] = None,
+    sha256: Optional[str] = None,
+):
+    """Truy vấn danh sách nhật ký kiểm toán với bộ lọc linh hoạt."""
+    try:
+        actual_limit = int(limit) if isinstance(limit, (int, str)) and str(limit).isdigit() else 50
+        actual_offset = int(offset) if isinstance(offset, (int, str)) and str(offset).isdigit() else 0
+
+        with engine.connect() as conn:
+            stmt = select(audit_logs).order_by(desc(audit_logs.c.id))
+            if client_id and isinstance(client_id, str):
+                stmt = stmt.where(audit_logs.c.client_id == client_id)
+            if sha256 and isinstance(sha256, str):
+                stmt = stmt.where(audit_logs.c.sha256 == sha256)
+            stmt = stmt.limit(actual_limit).offset(actual_offset)
+            results = conn.execute(stmt).fetchall()
+
+            logs_list = []
+            for r in results:
+                d = dict(r._mapping)
+                if isinstance(d.get("created_at"), datetime):
+                    d["created_at"] = d["created_at"].isoformat()
+                logs_list.append(d)
+            return {"total": len(logs_list), "logs": logs_list}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi truy vấn cơ sở dữ liệu: {e}")
+
+
+@app.get("/api/v1/audit-logs/verify/{sha256}")
+def verify_document_integrity(sha256: str):
+    """
+    Điểm kiểm định tài liệu (Integrity Verification):
+    Cho phép bất kỳ hệ thống nào kiểm tra xem file PDF có đúng do hệ thống cấp phát không.
+    """
+    try:
+        with engine.connect() as conn:
+            stmt = select(audit_logs).where(audit_logs.c.sha256 == sha256.strip()).limit(1)
+            row = conn.execute(stmt).fetchone()
+            if not row:
+                return {
+                    "verified": False,
+                    "sha256": sha256,
+                    "message": "Không tìm thấy tài liệu này trong nhật ký kiểm toán! File có thể bị giả mạo hoặc chưa từng được cấp phát.",
+                }
+            data = dict(row._mapping)
+            if isinstance(data.get("created_at"), datetime):
+                data["created_at"] = data["created_at"].isoformat()
+            return {
+                "verified": True,
+                "sha256": sha256,
+                "document": data,
+                "message": "Tài liệu chính thống đã được xác thực tính toàn vẹn và nguồn gốc cấp phát.",
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi kiểm tra tính toàn vẹn: {e}")
+
+
+@app.get("/api/v1/download/{filename}")
+def download_local_file(filename: str):
+    """Tải trực tiếp file từ thư mục tạm làm việc (hữu ích khi test cục bộ không có S3)."""
+    clean = os.path.basename(filename)
+    path = os.path.join("/tmp/wm_work", clean)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Tệp tin không tồn tại hoặc đã bị dọn dẹp.")
+    return FileResponse(path, media_type="application/pdf", filename=clean)
+
+
+# ==============================================================================
+# 7. GIAO DIỆN DEVELOPER PORTAL & PLAYGROUND (HTML/JS)
+# ==============================================================================
 @app.get("/", response_class=HTMLResponse)
-def index():
+def developer_portal():
     docs = list_available_docs()
     options_html = "\n".join(
-        f'<option value="{d}">{d}.pdf (Có sẵn trên S3)</option>' for d in docs
+        f'<option value="{d}">{d}.pdf</option>' for d in docs
     )
     return f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hệ thống Cấp phát Tài liệu Đóng dấu Bản quyền Động</title>
+  <title>Enterprise PDF Watermarking Microservice</title>
   <style>
-    * {{ box-sizing: border-box; font-family: 'Segoe UI', Roboto, Arial, sans-serif; }}
-    body {{ background: #f0f4f8; margin: 0; padding: 32px 16px; color: #1e293b; }}
-    .container {{ max-width: 680px; margin: 0 auto; background: #ffffff; border-radius: 12px;
-                  box-shadow: 0 10px 25px rgba(15, 23, 42, 0.08); padding: 32px; }}
-    .header {{ border-bottom: 2px solid #e2e8f0; padding-bottom: 16px; margin-bottom: 24px; }}
-    .header h1 {{ margin: 0 0 6px; font-size: 22px; color: #0f172a; }}
+    :root {{ --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --border: #e2e8f0; }}
+    * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }}
+    body {{ background: var(--bg); margin: 0; padding: 24px 16px; color: var(--text); }}
+    .container {{ max-width: 900px; margin: 0 auto; }}
+    .header {{ background: var(--card); border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); margin-bottom: 20px; border: 1px solid var(--border); }}
+    .header h1 {{ margin: 0 0 6px; font-size: 24px; color: #1e3a8a; display: flex; align-items: center; gap: 10px; }}
     .header p {{ margin: 0; font-size: 14px; color: #64748b; }}
+    .badge {{ display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; vertical-align: middle; }}
+    .tabs {{ display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }}
+    .tab-btn {{ background: none; border: none; padding: 8px 16px; font-size: 15px; font-weight: 600; color: #64748b; cursor: pointer; border-radius: 6px; }}
+    .tab-btn.active {{ background: #eff6ff; color: var(--primary); }}
+    .card {{ background: var(--card); border-radius: 12px; padding: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border: 1px solid var(--border); margin-bottom: 24px; }}
     .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-    @media (max-width: 600px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-    .field {{ margin-bottom: 18px; }}
-    label {{ display: block; font-weight: 600; font-size: 14px; margin-bottom: 6px; color: #334155; }}
+    @media (max-width: 640px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+    .field {{ margin-bottom: 16px; }}
+    label {{ display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; color: #334155; }}
     .hint {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
-    input[type="text"], select, input[type="file"] {{
-      width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px;
-      font-size: 14px; background: #f8fafc; transition: border-color 0.2s;
+    input[type="text"], input[type="file"], select {{
+      width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; background: #fff;
     }}
-    input[type="text"]:focus, select:focus {{ outline: none; border-color: #2563eb; background: #fff; }}
-    .box {{ background: #f8fafc; border: 1px dashed #94a3b8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
-    button {{
-      width: 100%; padding: 13px; background: #2563eb; color: #fff; border: none;
-      border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer;
+    input:focus, select:focus {{ outline: none; border-color: var(--primary); ring: 2px solid #bfdbfe; }}
+    button.btn-primary {{
+      width: 100%; padding: 12px; background: var(--primary); color: #fff; border: none; border-radius: 8px;
+      font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s;
     }}
-    button:hover {{ background: #1d4ed8; }}
+    button.btn-primary:hover {{ background: var(--primary-hover); }}
     button:disabled {{ background: #94a3b8; cursor: not-allowed; }}
-    .result {{ margin-top: 24px; padding: 18px; border-radius: 8px; background: #ecfdf5;
-               border: 1px solid #10b981; display: none; }}
+    .result {{ margin-top: 20px; padding: 16px; border-radius: 8px; background: #ecfdf5; border: 1px solid #10b981; display: none; }}
     .result.error {{ background: #fef2f2; border-color: #ef4444; }}
-    .meta {{ font-size: 13px; line-height: 1.7; word-break: break-all; }}
-    .download-btn {{
-      display: inline-block; margin-top: 12px; padding: 10px 18px; background: #059669;
-      color: #fff; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 14px;
-    }}
+    .meta-item {{ font-size: 13px; line-height: 1.8; word-break: break-all; }}
+    .btn-download {{ display: inline-block; margin-top: 10px; padding: 9px 16px; background: #059669; color: #fff; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 13px; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }}
+    th, td {{ padding: 10px; border-bottom: 1px solid var(--border); text-align: left; }}
+    th {{ background: #f1f5f9; color: #475569; font-weight: 600; }}
+    pre {{ background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 8px; font-size: 13px; overflow-x: auto; }}
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Dynamic PDF Watermarking</h1>
+      <h1>Enterprise PDF Watermarking Engine <span class="badge">v2.0 Microservice</span></h1>
+      <p>Microservice đóng dấu tài liệu động, kiểm định tính toàn vẹn (SHA-256) và kiểm toán phân tán trên AWS Cloud.</p>
     </div>
 
-    <form id="wmForm">
-      <div class="grid">
-        <div class="field">
-          <label for="student_id">Mã sinh viên *</label>
-          <input type="text" id="student_id" name="student_id" placeholder="VD: 24021507" required />
-        </div>
-        <div class="field">
-          <label for="full_name">Họ và tên sinh viên *</label>
-          <input type="text" id="full_name" name="full_name" placeholder="VD: Trần Nhật Hưng" required />
-        </div>
-      </div>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('playground')">🎮 Playground Thử nghiệm</button>
+      <button class="tab-btn" onclick="switchTab('audit')">📜 Nhật ký Kiểm toán & Xác minh</button>
+      <button class="tab-btn" onclick="switchTab('api-docs')">🔌 Hướng dẫn Tích hợp API</button>
+    </div>
 
-      <div class="box">
-        <div class="field" style="margin-bottom: 0;">
-          <label for="logo_file">Tải Logo đóng dấu (PNG / JPG)</label>
+    <!-- TAB 1: PLAYGROUND -->
+    <div id="tab-playground" class="card">
+      <form id="wmForm">
+        <div class="grid">
+          <div class="field">
+            <label>Mã hệ thống gọi (Client ID)</label>
+            <input type="text" name="client_id" value="crm-service" placeholder="VD: crm-service, edtech-app" />
+          </div>
+          <div class="field">
+            <label>Con dấu tổ chức (Stamp Text)</label>
+            <input type="text" name="stamp_text" value="CONFIDENTIAL" placeholder="VD: ACME CORP, UET-VNU" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Chữ chìm chéo giữa trang (Diagonal Watermark) 🌟</label>
+          <input type="text" name="diagonal_text" value="BẢN SAO KÊ BẢO MẬT - NGUYỄN VĂN A" placeholder="VD: CONFIDENTIAL, DRAFT, TÊN KHÁCH HÀNG" />
+          <div class="hint">Watermark chìm trong suốt xoay góc -42 độ phủ khắp từng trang tài liệu.</div>
+        </div>
+
+        <div class="grid">
+          <div class="field">
+            <label>Dòng tiêu đề trên (Header Text)</label>
+            <input type="text" name="header_text" value="Phát hành nội bộ | Mã truy xuất: ACC-98234" />
+          </div>
+          <div class="field">
+            <label>Dòng chân trang (Footer Text)</label>
+            <input type="text" name="footer_text" value="Tài liệu chỉ dùng cho mục đích xác minh tài chính" />
+          </div>
+        </div>
+
+        <div class="grid">
+          <div class="field">
+            <label>Tải PDF từ máy tính (Tùy chọn)</label>
+            <input type="file" id="pdf_file" name="pdf_file" accept="application/pdf" />
+          </div>
+          <div class="field">
+            <label>Hoặc chọn PDF có sẵn trên S3/EFS</label>
+            <select name="doc_code">
+              {options_html}
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Tải Logo tùy chỉnh (Tùy chọn)</label>
           <input type="file" id="logo_file" name="logo_file" accept="image/png,image/jpeg" />
-          <div class="hint">Logo sẽ được chèn vào góc trên bên phải mỗi trang. Nếu bỏ trống, hệ thống dùng con dấu mặc định UET-VNU.</div>
+          <div class="hint">Nếu tải logo, ảnh sẽ được đặt vào góc trên bên phải thay thế con dấu mặc định.</div>
         </div>
+
+        <button type="submit" id="submitBtn" class="btn-primary">⚡ Thực thi Đóng dấu & Xuất bản quyền</button>
+      </form>
+
+      <div id="resultBox" class="result"></div>
+    </div>
+
+    <!-- TAB 2: AUDIT LOGS -->
+    <div id="tab-audit" class="card" style="display: none;">
+      <h3 style="margin-top: 0;">Tra cứu & Kiểm định Tính toàn vẹn (Document Verification)</h3>
+      <div style="display: flex; gap: 8px; margin-bottom: 20px;">
+        <input type="text" id="verifyShaInput" placeholder="Dán mã SHA-256 vào đây để kiểm tra nguồn gốc tài liệu..." style="flex: 1;" />
+        <button onclick="verifyDoc()" class="btn-primary" style="width: auto; padding: 0 20px;">Kiểm tra</button>
       </div>
+      <div id="verifyResult" style="margin-bottom: 20px;"></div>
 
-      <div class="box">
-        <div class="field">
-          <label for="pdf_file">Tải tài liệu PDF từ máy tính (Tùy chọn)</label>
-          <input type="file" id="pdf_file" name="pdf_file" accept="application/pdf" />
-          <div class="hint">File tải lên sẽ được lưu tự động lên S3 & đồng bộ EFS cho toàn bộ cụm Worker.</div>
-        </div>
-        <div class="field" style="margin-bottom: 0;">
-          <label for="doc_code">Hoặc chọn tài liệu có sẵn trên S3</label>
-          <select id="doc_code" name="doc_code">
-            {options_html}
-          </select>
-        </div>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h4 style="margin: 0;">50 Bản ghi Kiểm toán gần nhất</h4>
+        <button onclick="loadAuditLogs()" style="background: none; border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor: pointer;">🔄 Làm mới</button>
       </div>
+      <div style="overflow-x: auto;">
+        <table id="auditTable">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Thời gian</th>
+              <th>Client ID</th>
+              <th>Tài liệu</th>
+              <th>Số trang</th>
+              <th>Worker Host</th>
+              <th>Thời gian xử lý</th>
+              <th>SHA-256 Hash</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="8" style="text-align: center; color: #64748b;">Đang tải dữ liệu...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
 
-      <button type="submit" id="submitBtn">Tạo & Tải tài liệu Bản quyền</button>
-    </form>
+    <!-- TAB 3: API DOCS -->
+    <div id="tab-api-docs" class="card" style="display: none;">
+      <h3 style="margin-top: 0;">Tích hợp Microservice qua RESTful API</h3>
+      <p style="font-size: 14px;">Bất kỳ dịch vụ nào (CRM, ERP, Web App) đều có thể gọi endpoint JSON chuẩn để đóng dấu tự động:</p>
 
-    <div id="resultBox" class="result"></div>
+      <h4>1. Gửi yêu cầu qua cURL:</h4>
+      <pre><code>curl -X POST "http://&lt;ALB_DNS&gt;/api/v1/watermark" \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "client_id": "crm-backend",
+    "source": {{ "s3_key": "input/ModelOptimization.pdf" }},
+    "watermark": {{
+      "diagonal_text": "CONFIDENTIAL - NGUYEN VAN A",
+      "header_text": "Hợp đồng đối tác số #10928",
+      "stamp_text": "ACME CORP"
+    }}
+  }}'</code></pre>
+
+      <h4>2. Swagger UI trực quan:</h4>
+      <p>Truy cập tài liệu OpenAPI chuẩn hóa tại: <a href="/docs" target="_blank" style="color: var(--primary); font-weight: 600;">/docs (Swagger UI)</a></p>
+    </div>
   </div>
 
   <script>
+    function switchTab(tab) {{
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('tab-playground').style.display = tab === 'playground' ? 'block' : 'none';
+      document.getElementById('tab-audit').style.display = tab === 'audit' ? 'block' : 'none';
+      document.getElementById('tab-api-docs').style.display = tab === 'api-docs' ? 'block' : 'none';
+      event.target.classList.add('active');
+      if (tab === 'audit') loadAuditLogs();
+    }}
+
+    // Xử lý gửi Form đóng dấu
     const form = document.getElementById('wmForm');
     const btn = document.getElementById('submitBtn');
     const resBox = document.getElementById('resultBox');
@@ -214,136 +859,89 @@ def index():
         }} else {{
           resBox.className = 'result';
           resBox.innerHTML = `
-            <div class="meta">
-              <strong>Trạng thái:</strong> Đóng dấu hoàn tất!<br/>
-              <strong>EC2 Worker xử lý:</strong> <code>${{data.worker_host}}</code><br/>
-              <strong>Tài liệu:</strong> <code>${{data.doc_code}}.pdf</code><br/>
-              <strong>SHA-256 định danh:</strong> <code>${{data.sha256}}</code>
+            <div class="meta-item">
+              <strong>Trạng thái:</strong> ✅ Đóng dấu hoàn tất thành công!<br/>
+              <strong>EC2 Worker thực thi:</strong> <code>${{data.worker_host}}</code><br/>
+              <strong>Tài liệu:</strong> <code>${{data.doc_code}}.pdf</code> (${{data.pages_count}} trang)<br/>
+              <strong>Thời gian xử lý:</strong> <code>${{data.processing_time_ms}} ms</code><br/>
+              <strong>Mã băm SHA-256 định danh:</strong> <code>${{data.sha256}}</code>
             </div>
-            <a class="download-btn" href="${{data.download_url}}" target="_blank">Tải xuống tài liệu PDF (Pre-signed URL)</a>
+            <a class="btn-download" href="${{data.download_url}}" target="_blank">📥 Tải tài liệu hoàn tất (Download)</a>
           `;
         }}
       }} catch (err) {{
         resBox.style.display = 'block';
         resBox.className = 'result error';
-        resBox.innerHTML = '<strong>Lỗi kết nối:</strong> ' + err.message;
+        resBox.innerHTML = '<strong>Lỗi kết nối máy chủ:</strong> ' + err.message;
       }} finally {{
         btn.disabled = false;
-        btn.textContent = 'Tạo & Tải tài liệu Bản quyền';
+        btn.textContent = '⚡ Thực thi Đóng dấu & Xuất bản quyền';
       }}
     }});
+
+    // Tải danh sách Audit Logs
+    async function loadAuditLogs() {{
+      const tbody = document.querySelector('#auditTable tbody');
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">Đang nạp dữ liệu từ CSDL...</td></tr>';
+      try {{
+        const resp = await fetch('/api/v1/audit-logs?limit=50');
+        const data = await resp.json();
+        if (!data.logs || !data.logs.length) {{
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #64748b;">Chưa có bản ghi kiểm toán nào.</td></tr>';
+          return;
+        }}
+        tbody.innerHTML = data.logs.map(l => `
+          <tr>
+            <td>#${{l.id}}</td>
+            <td>${{l.created_at ? l.created_at.substring(0, 19).replace('T', ' ') : '-'}}</td>
+            <td><code>${{l.client_id || 'default'}}</code></td>
+            <td>${{l.doc_name}}</td>
+            <td>${{l.pages_count || 0}}</td>
+            <td><small><code>${{l.worker_host}}</code></small></td>
+            <td>${{l.processing_time_ms ? l.processing_time_ms.toFixed(1) + ' ms' : '-'}}</td>
+            <td title="${{l.sha256}}"><code>${{l.sha256 ? l.sha256.substring(0, 14) + '...' : '-'}}</code></td>
+          </tr>
+        `).join('');
+      }} catch (err) {{
+        tbody.innerHTML = `<tr><td colspan="8" style="color: red; text-align: center;">Lỗi tải dữ liệu: ${{err.message}}</td></tr>`;
+      }}
+    }}
+
+    // Kiểm tra tính toàn vẹn qua mã SHA-256
+    async function verifyDoc() {{
+      const hash = document.getElementById('verifyShaInput').value.trim();
+      const resDiv = document.getElementById('verifyResult');
+      if (!hash) return;
+      resDiv.innerHTML = 'Đang tra cứu cơ sở dữ liệu...';
+      try {{
+        const resp = await fetch(`/api/v1/audit-logs/verify/${{hash}}`);
+        const data = await resp.json();
+        if (data.verified) {{
+          resDiv.innerHTML = `
+            <div style="background: #ecfdf5; border: 1px solid #10b981; padding: 12px; border-radius: 8px;">
+              <strong style="color: #065f46;">✅ TÀI LIỆU CHÍNH THỐNG:</strong> ${{data.message}}<br/>
+              <small>Client: <b>${{data.document.client_id}}</b> | Tài liệu: <b>${{data.document.doc_name}}</b> | Thời gian cấp: <b>${{data.document.created_at}}</b> | Máy chủ xử lý: <b>${{data.document.worker_host}}</b></small>
+            </div>
+          `;
+        }} else {{
+          resDiv.innerHTML = `
+            <div style="background: #fef2f2; border: 1px solid #ef4444; padding: 12px; border-radius: 8px; color: #991b1b;">
+              <strong>❌ KHÔNG HỢP LỆ:</strong> ${{data.message}}
+            </div>
+          `;
+        }}
+      }} catch (err) {{
+        resDiv.innerHTML = `<span style="color: red;">Lỗi khi kết nối API: ${{err.message}}</span>`;
+      }}
+    }}
   </script>
 </body>
 </html>"""
 
 
-@app.post("/api/watermark")
-async def create_watermark(
-    student_id: str = Form(...),
-    full_name: str = Form(...),
-    doc_code: str = Form("ModelOptimization"),
-    pdf_file: Optional[UploadFile] = File(None),
-    logo_file: Optional[UploadFile] = File(None),
-):
-    worker_host = socket.gethostname()
-    timestamp = int(time.time())
-
-    if pdf_file is not None and pdf_file.filename:
-        if not pdf_file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Chỉ chấp nhận tệp định dạng PDF.")
-        pdf_bytes = await pdf_file.read()
-        if not pdf_bytes:
-            raise HTTPException(status_code=400, detail="Tệp PDF tải lên bị rỗng.")
-        doc_code = sanitize_code(pdf_file.filename)
-        input_key = f"input/{doc_code}.pdf"
-        cached_input_path = os.path.join(EFS_DIR, "input", f"{doc_code}.pdf")
-        with open(cached_input_path, "wb") as f:
-            f.write(pdf_bytes)
-        s3_client.upload_file(cached_input_path, S3_BUCKET, input_key)
-    else:
-        doc_code = sanitize_code(doc_code)
-        input_key = f"input/{doc_code}.pdf"
-        cached_input_path = os.path.join(EFS_DIR, "input", f"{doc_code}.pdf")
-        if not os.path.exists(cached_input_path):
-            try:
-                s3_client.head_object(Bucket=S3_BUCKET, Key=input_key)
-                s3_client.download_file(S3_BUCKET, input_key, cached_input_path)
-            except Exception as e:
-                raise HTTPException(status_code=404, detail=f"Không tìm thấy PDF trên S3: {e}")
-
-    logo_bytes = None
-    if logo_file is not None and logo_file.filename:
-        logo_bytes = await logo_file.read()
-        if not logo_bytes:
-            logo_bytes = None
-
-    out_filename = f"{student_id}_{doc_code}_{timestamp}.pdf"
-    local_out_path = os.path.join("/tmp/wm_work", out_filename)
-    watermark_text = f"{student_id} - {full_name.upper()}"
-
-    font_kwargs = {"fontfile": UNICODE_FONT, "fontname": "dejavu"} if UNICODE_FONT else {}
-
-    try:
-        doc = fitz.open(cached_input_path)
-        for page in doc:
-            rect = page.rect
-            page.insert_text(
-                (42, 28),
-                f"{watermark_text} | {doc_code}",
-                fontsize=9,
-                color=(0.75, 0.15, 0.15),
-                **font_kwargs,
-            )
-            page.insert_text(
-                (42, rect.height - 20),
-                f"Tài liệu cấp phát cho SV {full_name} ({student_id})",
-                fontsize=8,
-                color=(0.4, 0.4, 0.4),
-                **font_kwargs,
-            )
-            if logo_bytes:
-                logo_rect = fitz.Rect(rect.width - 110, 14, rect.width - 30, 64)
-                page.insert_image(logo_rect, stream=logo_bytes, keep_proportion=True)
-            else:
-                stamp_rect = fitz.Rect(rect.width - 125, 16, rect.width - 35, 42)
-                page.draw_rect(stamp_rect, color=(0.8, 0.1, 0.1), width=1.2)
-                page.insert_text(
-                    (rect.width - 118, 33),
-                    "UET - VNU",
-                    fontsize=10,
-                    color=(0.8, 0.1, 0.1),
-                )
-        doc.save(local_out_path, garbage=3, deflate=True)
-        doc.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi xử lý PDF/Logo: {e}")
-
-    sha256_hash = hashlib.sha256()
-    with open(local_out_path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            sha256_hash.update(chunk)
-    digest = sha256_hash.hexdigest()
-
-    output_key = f"output/{out_filename}"
-    s3_client.upload_file(local_out_path, S3_BUCKET, output_key)
-    os.remove(local_out_path)
-
-    presigned_url = s3_client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": output_key},
-        ExpiresIn=3600,
-    )
-
-    log_audit(student_id, full_name, doc_code, digest, worker_host, output_key)
-
-    return {
-        "worker_host": worker_host,
-        "doc_code": doc_code,
-        "sha256": digest,
-        "download_url": presigned_url,
-    }
-
-
+# ==============================================================================
+# 8. ĐIỂM KHỞI CHẠY UVICORN
+# ==============================================================================
 if __name__ == "__main__":
     import uvicorn
 
