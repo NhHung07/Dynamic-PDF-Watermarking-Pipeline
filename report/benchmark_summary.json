@@ -1,0 +1,191 @@
+{
+  "timestamp": "2026-11-23T11:23:34",
+  "target_url": "http://PDF-Watermark-ALB-281030112.ap-southeast-1.elb.amazonaws.com",
+  "benchmark_matrix": [
+    {
+      "concurrency": 2,
+      "duration_s": 20.7,
+      "total_requests": 55,
+      "ok_requests": 55,
+      "err_requests": 0,
+      "error_rate_pct": 0.0,
+      "rps": 2.66,
+      "latency_ms": {
+        "mean": 743.1,
+        "p50": 716.1,
+        "p90": 801.9,
+        "p95": 835.1,
+        "p99": 1327.2,
+        "min": 663.3,
+        "max": 1327.2
+      },
+      "worker_distribution": {
+        "ip-10-0-11-13": {
+          "requests": 13,
+          "pct": 23.64
+        },
+        "ip-10-0-11-172": {
+          "requests": 14,
+          "pct": 25.45
+        },
+        "ip-10-0-12-121": {
+          "requests": 14,
+          "pct": 25.45
+        },
+        "ip-10-0-12-141": {
+          "requests": 14,
+          "pct": 25.45
+        }
+      },
+      "active_workers": 4
+    },
+    {
+      "concurrency": 4,
+      "duration_s": 20.4,
+      "total_requests": 86,
+      "ok_requests": 86,
+      "err_requests": 0,
+      "error_rate_pct": 0.0,
+      "rps": 4.22,
+      "latency_ms": {
+        "mean": 940.2,
+        "p50": 879.0,
+        "p90": 1214.4,
+        "p95": 1636.4,
+        "p99": 2083.1,
+        "min": 676.7,
+        "max": 2083.1
+      },
+      "worker_distribution": {
+        "ip-10-0-11-13": {
+          "requests": 22,
+          "pct": 25.58
+        },
+        "ip-10-0-11-172": {
+          "requests": 21,
+          "pct": 24.42
+        },
+        "ip-10-0-12-121": {
+          "requests": 22,
+          "pct": 25.58
+        },
+        "ip-10-0-12-141": {
+          "requests": 21,
+          "pct": 24.42
+        }
+      },
+      "active_workers": 4
+    },
+    {
+      "concurrency": 8,
+      "duration_s": 21.2,
+      "total_requests": 136,
+      "ok_requests": 135,
+      "err_requests": 1,
+      "error_rate_pct": 0.74,
+      "rps": 6.38,
+      "latency_ms": {
+        "mean": 1219.2,
+        "p50": 1079.6,
+        "p90": 1810.5,
+        "p95": 1902.1,
+        "p99": 2126.1,
+        "min": 716.8,
+        "max": 2195.7
+      },
+      "worker_distribution": {
+        "ip-10-0-11-13": {
+          "requests": 33,
+          "pct": 24.44
+        },
+        "ip-10-0-11-172": {
+          "requests": 34,
+          "pct": 25.19
+        },
+        "ip-10-0-12-121": {
+          "requests": 34,
+          "pct": 25.19
+        },
+        "ip-10-0-12-141": {
+          "requests": 34,
+          "pct": 25.19
+        }
+      },
+      "active_workers": 4
+    },
+    {
+      "concurrency": 12,
+      "duration_s": 23.5,
+      "total_requests": 150,
+      "ok_requests": 150,
+      "err_requests": 0,
+      "error_rate_pct": 0.0,
+      "rps": 6.38,
+      "latency_ms": {
+        "mean": 1727.1,
+        "p50": 1508.3,
+        "p90": 2893.1,
+        "p95": 3413.4,
+        "p99": 5484.3,
+        "min": 776.3,
+        "max": 6573.3
+      },
+      "worker_distribution": {
+        "ip-10-0-11-13": {
+          "requests": 38,
+          "pct": 25.33
+        },
+        "ip-10-0-11-172": {
+          "requests": 37,
+          "pct": 24.67
+        },
+        "ip-10-0-12-121": {
+          "requests": 38,
+          "pct": 25.33
+        },
+        "ip-10-0-12-141": {
+          "requests": 37,
+          "pct": 24.67
+        }
+      },
+      "active_workers": 4
+    },
+    {
+      "concurrency": 16,
+      "duration_s": 22.4,
+      "total_requests": 168,
+      "ok_requests": 167,
+      "err_requests": 1,
+      "error_rate_pct": 0.6,
+      "rps": 7.47,
+      "latency_ms": {
+        "mean": 2005.9,
+        "p50": 1882.6,
+        "p90": 2999.7,
+        "p95": 3524.9,
+        "p99": 4071.7,
+        "min": 942.5,
+        "max": 4261.6
+      },
+      "worker_distribution": {
+        "ip-10-0-11-13": {
+          "requests": 42,
+          "pct": 25.15
+        },
+        "ip-10-0-11-172": {
+          "requests": 42,
+          "pct": 25.15
+        },
+        "ip-10-0-12-121": {
+          "requests": 41,
+          "pct": 24.55
+        },
+        "ip-10-0-12-141": {
+          "requests": 42,
+          "pct": 25.15
+        }
+      },
+      "active_workers": 4
+    }
+  ]
+}

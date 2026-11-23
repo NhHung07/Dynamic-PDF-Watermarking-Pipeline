@@ -8,7 +8,7 @@ import os
 import sys
 import hashlib
 
-ALB_DNS = "http://PDF-Watermark-ALB-1315238985.ap-southeast-1.elb.amazonaws.com"
+ALB_DNS = "http://PDF-Watermark-ALB-281030112.ap-southeast-1.elb.amazonaws.com"
 
 
 def calculate_sha256(file_path: str, chunk_size: int = 65536) -> str:

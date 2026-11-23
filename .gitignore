@@ -15,7 +15,9 @@ venv/
 
 Đề tài BTL.pdf
 
-# Thư mục Báo cáo (Bỏ qua tất cả file phụ trợ, chỉ giữ lại file .tex và .pdf)
-report/*
-!report/*.tex
-!report/*.pdf
+# Thư mục Báo cáo (Bỏ qua file biên dịch tạm LaTeX, giữ lại source code, template, dữ liệu và pdf)
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc
+report/test_*.json
