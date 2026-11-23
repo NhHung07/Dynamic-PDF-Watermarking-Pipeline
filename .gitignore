@@ -14,3 +14,8 @@ venv/
 .vscode/
 
 Đề tài BTL.pdf
+
+# Thư mục Báo cáo (Bỏ qua tất cả file phụ trợ, chỉ giữ lại file .tex và .pdf)
+report/*
+!report/*.tex
+!report/*.pdf

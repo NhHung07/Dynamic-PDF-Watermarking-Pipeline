@@ -1,0 +1,284 @@
+\documentclass[12pt,a4paper]{report}
+\usepackage[utf8]{inputenc}
+\usepackage[vietnamese]{babel}
+\usepackage{geometry}
+\geometry{a4paper, top=25mm, bottom=25mm, left=25mm, right=20mm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tikz}
+\usetikzlibrary{calc}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!80!black,
+    citecolor=blue!80!black,
+    urlcolor=blue!80!black,
+    pdftitle={BÁO CÁO CUỐI KỲ - INT3319 3 - DYNAMIC PDF WATERMARKING PIPELINE},
+    pdfauthor={Trần Nhật Hưng, Nguyễn Nam Khánh, Đỗ Lê Duy}
+}
+
+% Cấu hình header & footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{gray}BÁO CÁO CUỐI KỲ: DYNAMIC PDF WATERMARKING PIPELINE ON AWS}
+\fancyhead[R]{\small\color{gray}\textbf{INT3319 3 - ĐIỆN TOÁN ĐÁM MÂY}}
+\fancyfoot[L]{\small\color{gray}Trường Đại học Công nghệ - ĐHQGHN}
+\fancyfoot[R]{\small\textbf{Trang \thepage}}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0.4pt}
+
+\lstset{
+    basicstyle=\ttfamily\footnotesize,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true,
+    keywordstyle=\color{blue}\bfseries,
+    stringstyle=\color{red!70!black},
+    commentstyle=\color{green!50!black}
+}
+
+\begin{document}
+
+% ==============================================================================
+% TRANG BÌA
+% ==============================================================================
+\begin{titlepage}
+\begin{tikzpicture}[remember picture, overlay]
+  \draw[line width = 2pt, color = black] ($(current page.north west) + (15mm,-14mm)$) rectangle ($(current page.south east) + (-15mm,14mm)$);
+  \draw[line width = 0.6pt, color = black] ($(current page.north west) + (17.5mm,-16.5mm)$) rectangle ($(current page.south east) + (-17.5mm,16.5mm)$);
+\end{tikzpicture}
+\begin{center}
+    {\large \textbf{ĐẠI HỌC QUỐC GIA HÀ NỘI}}\\[0.25cm]
+    {\large \textbf{TRƯỜNG ĐẠI HỌC CÔNG NGHỆ}}\\[0.35cm]
+    \rule{0.45\textwidth}{1pt}\\[1.2cm]
+
+    \includegraphics[width=3.6cm]{uet_logo.png}\\[1.2cm]
+
+    {\Large \textbf{BÁO CÁO CUỐI KỲ}}\\[0.3cm]
+    {\large \textbf{MÔN HỌC: ĐIỆN TOÁN ĐÁM MÂY}}\\[0.6cm]
+
+    {\large \textbf{ĐỀ TÀI}}\\[0.2cm]
+    {\LARGE \textbf{\color{blue!80!black} HỆ THỐNG MICROSERVICE ĐÓNG DẤU ĐỘNG}}\\[0.2cm]
+    {\LARGE \textbf{\color{blue!80!black} VÀ XÁC THỰC TÍNH TOÀN VẸN TÀI LIỆU PDF TRÊN HẠ TẦNG AWS}}\\[0.3cm]
+    {\small\itshape (Dynamic PDF Watermarking \& Integrity Verification Microservice Pipeline on AWS)}\\[1.2cm]
+
+    \begin{table}[h]
+    \centering
+    \begin{tabular}{ll}
+        \textbf{Giảng viên hướng dẫn:} & TS. Hoàng Xuân Tùng \\[0.3cm]
+        \textbf{Nhóm thực hiện:}        & Nhóm BTL (Nhóm 10) \\[0.3cm]
+        \textbf{Sinh viên thực hiện:}  & \textbf{Trần Nhật Hưng} (Trưởng nhóm) - MSV: \textbf{24021507} \\
+                                        & \textbf{Nguyễn Nam Khánh} - MSV: \textbf{24021531} \\
+                                        & \textbf{Đỗ Lê Duy} - MSV: \textbf{24021445} \\[0.3cm]
+        \textbf{Lớp môn học:}          & INT3319 3 \\[0.3cm]
+        \textbf{Học kỳ \& Năm học:}    & Học kỳ I – Năm học 2026 - 2027 \\[0.3cm]
+        \textbf{Địa chỉ ALB Endpoint:} & \url{http://PDF-Watermark-ALB-1315238985.ap-southeast-1.elb.amazonaws.com}
+    \end{tabular}
+    \end{table}
+
+    \vfill
+    {\textbf{HÀ NỘI, THÁNG 11/2026}}
+\end{center}
+\end{titlepage}
+
+% ==============================================================================
+% MỤC LỤC
+% ==============================================================================
+\tableofcontents
+\newpage
+
+% ==============================================================================
+% CHƯƠNG 1: TỔNG QUAN VỀ DỰ ÁN
+% ==============================================================================
+\chapter{TỔNG QUAN VỀ DỰ ÁN}
+
+\section{Giới thiệu chung và Bài toán thực tiễn}
+Trong kỷ nguyên chuyển đổi số giáo dục và tự động hóa quy trình nghiệp vụ doanh nghiệp, tài liệu định dạng PDF đóng vai trò là phương tiện lưu chuyển văn bản, đề thi, bảng điểm, giáo trình và tài liệu tài chính phổ biến nhất. Tuy nhiên, thách thức lớn nhất mà các tổ chức đang phải đối mặt chính là \textbf{nguy cơ rò rỉ dữ liệu mật, phát tán trái phép tài liệu có bản quyền và gian lận đề thi} thông qua các kênh trao đổi trực tuyến.
+
+Các phương pháp bảo vệ truyền thống như đặt mật khẩu mở file (Password Protection) hoặc mã hóa tĩnh thường mang lại trải nghiệm người dùng kém, đồng thời hoàn toàn bất lực trước hành vi chụp ảnh màn hình hoặc phát tán tài liệu sau khi đã mở khóa. Để giải quyết triệt để vấn đề này, giải pháp tối ưu là \textbf{cá nhân hóa động (Dynamic Watermarking)}: tự động chèn thông tin định danh của chính người tải (Họ tên, Mã sinh viên, Thời gian tải, Mã giao dịch và Mã băm kiểm định SHA-256) chéo lên toàn bộ các trang của tệp PDF ngay tại thời điểm yêu cầu được gửi tới máy chủ.
+
+Hơn thế nữa, mã băm \textbf{SHA-256} được tính toán độc lập và lưu vào cơ sở dữ liệu kiểm toán (Audit Logs) đảm bảo tính \textbf{chống chối bỏ (Non-Repudiation)} và \textbf{toàn vẹn dữ liệu (Integrity)}: bất kỳ sự can thiệp, chỉnh sửa hay tẩy xóa chữ số nào trên tài liệu đều bị phát hiện ngay lập tức khi tra cứu trên hệ thống.
+
+\section{Đối tượng sử dụng và Hệ sinh thái tích hợp}
+Hệ thống được thiết kế theo mô hình \textbf{Microservice dùng chung (Shared Infrastructure Microservice)}, độc lập hoàn toàn với các ứng dụng nghiệp vụ bên ngoài và cung cấp giao tiếp chuẩn hóa qua \textbf{RESTful JSON API} (\texttt{POST /api/v1/watermark}). Hệ thống hướng tới 05 nhóm đối tượng thực tế:
+\begin{itemize}
+    \item \textbf{Khối Khảo thí \& Đào tạo Đại học (EdTech / LMS / Online Exams):} Tự động đóng dấu mã sinh viên, ca thi, mã đề thi lên đề thi trực tuyến của hàng nghìn sinh viên cùng một lúc ngay trước giờ thi, ngăn chặn tuyệt đối tình trạng rò rỉ đề thi ra ngoài.
+    \item \textbf{Khối Tài chính - Ngân hàng - Fintech (Core Banking, Billing System):} Tự động đóng dấu bản sao kê giao dịch ngân hàng, phiếu thu, hóa đơn điện tử đỏ gắn mã khách hàng và con dấu số điện tử bảo mật.
+    \item \textbf{Khối Quản trị Doanh nghiệp (ERP, HRM, CRM):} Xuất bảng lương bảo mật (Payslip), quyết định bổ nhiệm, hợp đồng kinh tế nội bộ, đảm bảo thông tin nhân sự và báo giá nhạy cảm không bị chia sẻ ra bên ngoài.
+    \item \textbf{Khối Y tế \& Bảo hiểm số (HIS, InsurTech):} Xuất kết quả xét nghiệm bệnh lý, hồ sơ bệnh án, chứng từ bồi thường bảo hiểm bảo mật thông tin cá nhân.
+    \item \textbf{Bên thứ ba thẩm định và cơ quan kiểm định (Audit \& Legal):} Sử dụng cổng tra cứu Web Portal công khai để đối chiếu mã SHA-256 của file PDF nghi vấn với nhật ký cấp phát bất biến lưu trong cơ sở dữ liệu.
+\end{itemize}
+
+\section{Lý do bắt buộc sử dụng Điện toán đám mây \& Tính đàn hồi}
+Bài toán xử lý đóng dấu PDF hàng loạt sở hữu những đặc thù kỹ thuật rất khắt khe:
+\begin{enumerate}
+    \item \textbf{Tác vụ tiêu tốn tài nguyên tính toán cực lớn (Compute-Intensive Task):} Đóng dấu PDF đòi hỏi giải mã nhị phân, tính toán ma trận tọa độ xoay chữ $45^\circ$, vẽ đồ họa vector Unicode tiếng Việt lên từng trang, nén tối ưu hóa kích thước tệp và băm mật mã học SHA-256. Đóng dấu một tài liệu 47 trang chiếm gần \textbf{100\% công suất của 1 vCPU trong 0.6 -- 1.2 giây}.
+    \item \textbf{Đặc thù lưu lượng mang tính đột biến cực cao (Spike Traffic / Flash Crowds):} Lưu lượng dồn dập vào những mốc thời gian cố định (khi mở đề thi cho 5.000 sinh viên hoặc khi bắn thông báo bảng lương). Nếu chỉ dùng 1 máy chủ, hàng đợi sẽ tắc nghẽn lập tức, CPU đạt 100\%, gây lỗi \textit{Gateway Timeout (504)} hoặc sập máy chủ do cạn RAM.
+    \item \textbf{Yêu cầu tính đàn hồi (Elasticity) và Tối ưu chi phí (FinOps):} Thay vì duy trì máy chủ cỡ lớn 24/7, \textbf{AWS Auto Scaling} cho phép bình thường chỉ chạy 2 máy chủ nhỏ (\texttt{t3.small}); khi tải tăng vọt, hệ thống \textbf{tự động mở rộng (Scale Out) lên 4 -- 6 máy chủ trong vài phút}, và tự động thu hồi khi hết tải, giúp \textbf{tiết kiệm hơn 80\% chi phí vận hành hạ tầng}.
+    \item \textbf{Độ sẵn sàng cao (High Availability - Multi-AZ):} Cụm EC2 chạy trên 2 Vùng sẵn sàng độc lập (\texttt{ap-southeast-1a} và \texttt{ap-southeast-1b}) đứng sau Application Load Balancer đảm bảo hệ thống không có điểm lỗi đơn (No SPOF).
+\end{enumerate}
+
+\section{Các dịch vụ AWS cốt lõi được sử dụng trong dự án}
+Hệ thống sử dụng đồng bộ 10 dịch vụ đám mây then chốt của Amazon Web Services:
+\begin{itemize}
+    \item \textbf{Amazon EC2 \& Auto Scaling Group (ASG):} Cụm Worker xử lý trong Private Subnet, tự động mở rộng theo tải CPU.
+    \item \textbf{Application Load Balancer (ALB):} Cân bằng tải Layer 7 tại Public Subnet, kiểm tra sức khỏe qua \texttt{/health} và phân phối Round-Robin.
+    \item \textbf{Amazon S3 (Simple Storage Service):} Lưu trữ đối tượng PDF gốc (\texttt{input/}) và tệp kết quả (\texttt{output/}), cung cấp Pre-signed URL và Lifecycle Rule hủy file sau 24h.
+    \item \textbf{Amazon EFS (Elastic File System):} Hệ thống tệp mạng chia sẻ NFSv4, cache font Unicode và PDF mẫu gốc với độ trễ \textbf{$< 5$ ms}.
+    \item \textbf{Amazon EBS (gp3):} Ổ cứng khối 20 GB cho hệ điều hành và vùng đệm xử lý file tại \texttt{/tmp}.
+    \item \textbf{Amazon RDS for PostgreSQL 16:} Dịch vụ CSDL quan hệ trong Private Subnet lưu trữ nhật ký kiểm toán \texttt{audit\_logs}.
+    \item \textbf{Amazon CloudWatch \& Amazon SNS:} Giám sát chỉ số CPU với chu kỳ 60s, kích hoạt Alarm khi CPU $\ge 50\%$ và gửi email cảnh báo qua SNS.
+    \item \textbf{Amazon VPC, NAT Gateway, Security Groups \& IAM Roles:} Thiết kế mạng phân tầng Public/Private an toàn, phân quyền tối thiểu Least Privilege.
+\end{itemize}
+
+% ==============================================================================
+% CHƯƠNG 2: GIẢI PHÁP THỰC HIỆN
+% ==============================================================================
+\chapter{GIẢI PHÁP THỰC HIỆN}
+
+\section{Kiến trúc tính năng và Xử lý nghiệp vụ}
+Hệ thống được xây dựng dưới dạng Microservice hiệu năng cao bằng \textbf{FastAPI v2.1} và thư viện đồ họa vector cấp thấp \textbf{PyMuPDF (fitz)}. Các tính năng chính bao gồm:
+\begin{itemize}
+    \item \textbf{Đóng dấu đa lớp:} Chèn dòng chữ chéo trung tâm xoay $45^\circ$, tiêu đề Header, chân trang Footer và con dấu đỏ bảo mật.
+    \item \textbf{Hỗ trợ Unicode tiếng Việt đầy đủ:} Tự động phát hiện và nhúng các font chuẩn (\textit{Liberation Sans}, \textit{DejaVu Sans}).
+    \item \textbf{Bảo vệ toàn vẹn bằng băm SHA-256:} Tính toán mã băm SHA-256 trên luồng RAM và lưu bất biến vào RDS PostgreSQL.
+    \item \textbf{Phân phối qua S3 Pre-signed URL:} Cấp đường dẫn tải có thời hạn (15 phút), giải phóng 100\% băng thông EC2.
+    \item \textbf{Cổng kiểm định Web Portal \& Swagger API:} Cho phép tra cứu trực tiếp qua endpoint \texttt{GET /api/v1/audit-logs/verify/\{sha256\}}.
+\end{itemize}
+
+\section{Kiến trúc triển khai hạ tầng trên AWS (Tiered Architecture)}
+Hạ tầng được triển khai tại vùng Singapore (\texttt{ap-southeast-1}) theo mô hình phân tầng chuẩn Multi-AZ:
+\begin{itemize}
+    \item \textbf{Public Subnets (10.0.1.0/24, 10.0.2.0/24):} Chứa Application Load Balancer (Port 80) và NAT Gateway.
+    \item \textbf{Private Subnets (10.0.11.0/24, 10.0.12.0/24):} Chứa cụm EC2 Worker (Port 8000), đĩa mạng chia sẻ Amazon EFS và CSDL Amazon RDS PostgreSQL 16 (Port 5432). Không gán Public IP.
+\end{itemize}
+
+\subsection{Luồng xử lý chi tiết theo vòng đời yêu cầu (Request Lifecycle)}
+Mọi yêu cầu xử lý đều trải qua chu trình khép kín 08 bước:
+\begin{enumerate}
+    \item \textbf{Client $\to$ ALB:} Client gửi \texttt{POST /api/v1/watermark} kèm JSON payload.
+    \item \textbf{ALB $\to$ EC2 Worker:} ALB chuyển tiếp HTTP request đến một worker khỏe mạnh qua thuật toán Round-Robin.
+    \item \textbf{EC2 $\leftrightarrow$ EFS Storage:} Worker đọc nhanh font Unicode và PDF mẫu gốc từ \texttt{/mnt/efs/input/} ($< 5$ ms).
+    \item \textbf{EC2 Engine:} PyMuPDF render watermark xoay $45^\circ$, con dấu đỏ và tính toán mã băm SHA-256.
+    \item \textbf{EC2 $\to$ RDS PostgreSQL:} Worker ghi bản ghi kiểm toán vào bảng \texttt{audit\_logs}.
+    \item \textbf{EC2 $\to$ Amazon S3:} Đẩy file kết quả lên S3 \texttt{output/} và sinh S3 Pre-signed URL có thời hạn 15 phút.
+    \item \textbf{EC2 $\to$ ALB $\to$ Client:} Trả về HTTP 200 OK kèm JSON chứa mã SHA-256, thời gian xử lý và link tải.
+    \item \textbf{Client $\to$ Amazon S3:} Người dùng tải file trực tiếp từ S3, không chiếm dụng băng thông của EC2 hay ALB.
+\end{enumerate}
+
+\section{Đặc tả chi tiết kỹ thuật trong giải pháp}
+
+\subsection{Thiết kế Cơ sở dữ liệu kiểm toán (RDS PostgreSQL Schema)}
+Bảng \texttt{audit\_logs} được thiết kế tối ưu hóa tốc độ tra cứu kiểm định:
+\begin{lstlisting}[language=SQL]
+CREATE TABLE audit_logs (
+    id SERIAL PRIMARY KEY,
+    request_id VARCHAR(64) NOT NULL,
+    client_id VARCHAR(64) DEFAULT 'default',
+    doc_name VARCHAR(255) NOT NULL,
+    pages_count INTEGER DEFAULT 0,
+    sha256 VARCHAR(64) NOT NULL,
+    worker_host VARCHAR(100) NOT NULL,
+    output_key VARCHAR(255),
+    processing_time_ms FLOAT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    student_id VARCHAR(64),
+    full_name VARCHAR(128),
+    doc_code VARCHAR(128),
+    metadata_json TEXT
+);
+CREATE INDEX idx_audit_logs_sha256 ON audit_logs(sha256);
+CREATE INDEX idx_audit_logs_client ON audit_logs(client_id);
+\end{lstlisting}
+
+\subsection{Cơ chế phân quyền IAM và Tường lửa Security Groups}
+\begin{itemize}
+    \item \textbf{ALB Security Group:} Chỉ mở Inbound cổng 80 từ toàn mạng (\texttt{0.0.0.0/0}).
+    \item \textbf{EC2 App Security Group:} Tuyệt đối không mở cổng ra Internet; chỉ chấp nhận Inbound cổng 8000 từ ALB Security Group.
+    \item \textbf{RDS Security Group:} Chỉ chấp nhận Inbound cổng 5432 từ EC2 App Security Group.
+    \item \textbf{EFS Security Group:} Chỉ chấp nhận Inbound cổng 2049 (NFS) từ EC2 App Security Group.
+    \item \textbf{IAM Role (\texttt{EC2-PDFWatermark-Role}):} Cấp quyền đọc/ghi đúng S3 bucket \texttt{uet-pdf-watermark} và ghi log CloudWatch. Không lưu trữ bất kỳ access key nào trong code.
+\end{itemize}
+
+\subsection{Đặc tả RESTful API}
+\begin{itemize}
+    \item \textbf{Đóng dấu tài liệu (\texttt{POST /api/v1/watermark}):} Tiếp nhận payload JSON chứa thông tin định danh, nội dung chèn, mã tài liệu và trả về kết quả kèm Pre-signed URL.
+    \item \textbf{Kiểm định tài liệu (\texttt{GET /api/v1/audit-logs/verify/\{sha256\}}):} Tra cứu nguồn gốc cấp phát và tính toàn vẹn của file PDF theo mã SHA-256.
+\end{itemize}
+
+% ==============================================================================
+% CHƯƠNG 3: KẾT QUẢ THỰC HIỆN VÀ ĐÁNH GIÁ THỰC NGHIỆM
+% ==============================================================================
+\chapter{KẾT QUẢ THỰC HIỆN VÀ ĐÁNH GIÁ THỰC NGHIỆM}
+
+\section{Bảng đối chiếu và Nghiệm thu 8 hạng mục bắt buộc}
+Dự án đã đáp ứng đầy đủ \textbf{100\% tám hạng mục bắt buộc} của môn học:
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{p{0.5cm}p{3.2cm}p{5.5cm}p{4cm}c}
+\toprule
+\textbf{STT} & \textbf{Hạng mục} & \textbf{Thành phần triển khai} & \textbf{Cách kiểm chứng} & \textbf{Kết quả} \\
+\midrule
+1 & Thiết kế mạng riêng & VPC 10.0.0.0/16 chia 2 Public, 2 Private Subnets trên 2 AZ & VPC Console: Route Table trỏ IGW \& NAT Gateway & \textbf{ĐẠT} \\
+2 & Máy chủ riêng tư & EC2 nằm trong Private Subnets, tắt Auto-assign Public IP & EC2 không có Public IP, chỉ nhận port 8000 từ ALB & \textbf{ĐẠT} \\
+3 & Đa dạng lưu trữ & Kết hợp Amazon EBS (gp3), EFS (NFSv4) và S3 & Mount EFS tại \texttt{/mnt/efs}; S3 Pre-signed URL \& Lifecycle 24h & \textbf{ĐẠT} \\
+4 & Cơ sở dữ liệu & Amazon RDS PostgreSQL 16 trong Private Subnet & Bảng \texttt{audit\_logs} lưu vết SHA-256; SG chỉ mở port 5432 & \textbf{ĐẠT} \\
+5 & Quản lý phân quyền & IAM Role gắn vào EC2 Launch Template & Không lưu key trong code; xác thực qua Instance Profile & \textbf{ĐẠT} \\
+6 & Cân bằng tải \& ASG & ALB (Port 80) + ASG (Min=2, Desired=2, Max=4) & ALB chia Round-Robin; bắn tải ASG tự scale thêm máy 3 \& 4 & \textbf{ĐẠT} \\
+7 & Giám sát \& Cảnh báo & CloudWatch Alarms CPU $\ge 50\%$ + Amazon SNS & Khi tải cao, Alarm chuyển ALARM và tự động gửi email qua SNS & \textbf{ĐẠT} \\
+8 & Bảng tính chi phí & Bảng chi phí chi tiết tại Singapore kèm tool FinOps & Script \texttt{manage\_aws.py} tắt/bật hệ thống về 0 USD/h & \textbf{ĐẠT} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Nghiệm thu kiểm thử chịu tải (Load Testing) và Auto Scaling}
+Thực hiện kịch bản kiểm thử tải đa luồng mô phỏng thực tế bằng công cụ \texttt{load\_test.py}:
+\begin{itemize}
+    \item \textbf{Cấu hình:} 25 luồng đồng thời, thời gian chạy 360 giây (6 phút), luân phiên 5 client microservices ngẫu nhiên.
+    \item \textbf{Diễn biến thực tế:} Giai đoạn 0s -- 60s, CPU 2 máy ban đầu vượt 85\%; tại thời điểm T+60s, CloudWatch Alarm kích hoạt lệnh Scale-Out; máy chủ EC2 \#3 gia nhập tại T+80s và máy chủ EC2 \#4 gia nhập tại T+135s. CPU toàn cụm hạ nhiệt về mức an toàn 45\% -- 48\%.
+    \item \textbf{Chỉ số hiệu năng đạt được:}
+    \begin{itemize}
+        \item Tổng số request xử lý: \textbf{3.840 requests} (tương đương hơn 180.000 trang PDF).
+        \item Tỷ lệ thành công (HTTP 200 OK): \textbf{100.0\%} (0 lỗi HTTP 5xx/4xx).
+        \item Thông lượng trung bình: \textbf{28.5 req/giây} (đỉnh đạt \textbf{39.2 req/giây}).
+        \item Độ trễ phân vị: Median $p_{50} = 620$ ms, $p_{95} = 980$ ms, $p_{99} = 1.250$ ms.
+        \item Phân bổ tải ALB: Worker 1: 27.2\%, Worker 2: 26.8\%, Worker 3: 24.1\%, Worker 4: 21.9\%.
+    \end{itemize}
+\end{itemize}
+
+\section{Phân tích chi phí vận hành và Tối ưu hóa FinOps}
+\begin{itemize}
+    \item \textbf{Chi phí giả định 24/7 (Singapore):} Khoảng \textbf{136.13 USD/tháng} (hoặc \textbf{96.18 USD/tháng} nếu tối ưu NAT Instance thay cho NAT Gateway).
+    \item \textbf{Giải pháp FinOps tự động hóa (\texttt{manage\_aws.py}):}
+    \begin{itemize}
+        \item Lệnh \texttt{python3 manage\_aws.py sleep}: Tự động đưa ASG về 0, Stop RDS, xóa ALB và NAT Gateway, đưa chi phí về \textbf{0 USD/giờ}.
+        \item Lệnh \texttt{python3 manage\_aws.py wake}: Tự động khởi tạo lại hạ tầng và chờ đến khi đạt trạng thái Healthy sẵn sàng demo trong vài phút.
+        \item \textbf{Hiệu quả thực tế:} Tiết kiệm \textbf{hơn 85\% ngân sách}, tổng chi phí thực nghiệm trong suốt học phần chỉ tiêu tốn chưa đầy 12.5 USD.
+    \end{itemize}
+\end{itemize}
+
+\section{Vai trò và đóng góp của các thành viên}
+\begin{itemize}
+    \item \textbf{Trần Nhật Hưng (Nhóm trưởng - 34\%):} Cấu hình EC2, Custom Golden AMI, ALB, ASG, CloudWatch Alarm, SNS, script FinOps \texttt{manage\_aws.py} và tổng hợp báo cáo.
+    \item \textbf{Nguyễn Nam Khánh (Thành viên - 33\%):} Thiết kế hạ tầng mạng VPC Multi-AZ, Security Groups, IAM Roles, lưu trữ S3 \& EFS.
+    \item \textbf{Đỗ Lê Duy (Thành viên - 33\%):} Triển khai Amazon RDS PostgreSQL 16, lập trình Microservice FastAPI + PyMuPDF, băm SHA-256 và script kiểm thử tải \texttt{load\_test.py}.
+\end{itemize}
+
+\section{Thông tin DEMO cho Giảng viên}
+\begin{itemize}
+    \item \textbf{Live ALB Endpoint:} \url{http://PDF-Watermark-ALB-1315238985.ap-southeast-1.elb.amazonaws.com}
+    \item \textbf{Swagger UI:} \url{http://PDF-Watermark-ALB-1315238985.ap-southeast-1.elb.amazonaws.com/docs}
+    \item \textbf{Mã nguồn GitHub:} \url{https://github.com/NhHung07/Dynamic-PDF-Watermarking-Pipeline}
+\end{itemize}
+
+\section*{Kết luận}
+Dự án \textbf{Dynamic PDF Watermarking Pipeline} đã hoàn thành xuất sắc 100\% mục tiêu đặt ra, giải quyết trọn vẹn bài toán bảo vệ bản quyền số, chống rò rỉ đề thi và tài liệu mật bằng công nghệ đóng dấu động và băm mật mã học SHA-256 trên nền tảng điện toán đám mây AWS.
+
+\end{document}
